@@ -231,6 +231,10 @@ impl InsertFormatted {
         self.end_timeout = Timeout::new_opt(end_timeout);
     }
 
+    pub(crate) fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
     /// Wrap this `InsertFormatted` with a buffer of a default size.
     ///
     /// The returned type also implements [`AsyncWrite`].
@@ -530,6 +534,10 @@ impl BufInsertFormatted {
         end_timeout: Option<Duration>,
     ) {
         self.insert.set_timeouts(send_timeout, end_timeout);
+    }
+
+    pub(crate) fn span(&self) -> &tracing::Span {
+        self.insert.span()
     }
 
     /// Write data to the buffer without waiting for it to be flushed.
