@@ -1,3 +1,9 @@
+#[cfg(feature = "lz4")]
+use crate::compression::lz4::Lz4Decoder;
+use crate::{
+    compression::Compression,
+    error::{Error, Result},
+};
 use bstr::ByteSlice;
 use bytes::{BufMut, Bytes};
 use futures_util::stream::{self, Stream, TryStreamExt};
@@ -12,13 +18,7 @@ use std::{
     pin::{Pin, pin},
     task::{Context, Poll},
 };
-
-#[cfg(feature = "lz4")]
-use crate::compression::lz4::Lz4Decoder;
-use crate::{
-    compression::Compression,
-    error::{Error, Result},
-};
+use tracing::Instrument;
 
 // === Response ===
 
@@ -34,34 +34,53 @@ pub(crate) type ResponseFuture = Pin<Box<dyn Future<Output = Result<Chunks>> + S
 
 impl Response {
     pub(crate) fn new(response: HyperResponseFuture, compression: Compression) -> Self {
-        Self::Waiting(Box::pin(async move {
-            let response = response.await?;
+        let span = tracing::error_span!("response");
+        let instrument_span = span.clone();
 
-            let status = response.status();
-            let exception_code = response.headers().get("X-ClickHouse-Exception-Code");
+        Self::Waiting(Box::pin(
+            async move {
+                let response = response.await?;
 
-            if status == StatusCode::OK && exception_code.is_none() {
-                let tag = response
-                    .headers()
-                    .get("X-ClickHouse-Exception-Tag")
-                    .map(|value| value.as_bytes().into());
+                let status = response.status();
+                let exception_code = response.headers().get("X-ClickHouse-Exception-Code");
 
-                // More likely to be successful, start streaming.
-                // It still can fail, but we'll handle it in `DetectDbException`.
-                Ok(Chunks::new(response.into_body(), compression, tag))
-            } else {
-                // An instantly failed request.
-                Err(collect_bad_response(
-                    status,
-                    exception_code
-                        .and_then(|value| value.to_str().ok())
-                        .map(|code| format!("Code: {code}")),
-                    response.into_body(),
-                    compression,
-                )
-                .await)
+                tracing::record_all!(
+                    span,
+                    // Note: not supposed to set `otel.status_code` until the entire request is successful
+                    db.response.status_code = status.as_u16(),
+                );
+
+                if status == StatusCode::OK && exception_code.is_none() {
+                    let tag = response
+                        .headers()
+                        .get("X-ClickHouse-Exception-Tag")
+                        .map(|value| value.as_bytes().into());
+
+                    // More likely to be successful, start streaming.
+                    // It still can fail, but we'll handle it in `DetectDbException`.
+                    Ok(Chunks::new(response.into_body(), compression, tag))
+                } else {
+                    // An instantly failed request.
+                    let error = collect_bad_response(
+                        status,
+                        exception_code
+                            .and_then(|value| value.to_str().ok())
+                            .map(|code| format!("Code: {code}")),
+                        response.into_body(),
+                        compression,
+                    )
+                    .await;
+
+                    tracing::record_all!(
+                        span,
+                        error.type = error.error_type(),
+                    );
+
+                    Err(error)
+                }
             }
-        }))
+            .instrument(instrument_span),
+        ))
     }
 
     pub(crate) fn into_future(self) -> ResponseFuture {

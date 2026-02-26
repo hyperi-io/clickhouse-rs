@@ -14,6 +14,7 @@ use clickhouse_types::error::TypesError;
 use clickhouse_types::parse_rbwnat_columns_header;
 use polonius_the_crab::prelude::*;
 use std::marker::PhantomData;
+use std::num::Saturating;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
@@ -27,6 +28,7 @@ pub struct RowCursor<T> {
     /// as [`RowCursor::new`] is not `async`, so it loads lazily.
     row_metadata: Option<RowMetadata>,
     span: tracing::Span,
+    returned_rows: Saturating<u64>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -39,6 +41,7 @@ impl<T> RowCursor<T> {
             row_metadata: None,
             validation,
             span,
+            returned_rows: Saturating(0),
         }
     }
 
@@ -129,6 +132,7 @@ impl<T> RowCursor<T> {
 
                     match result {
                         Ok(value) => {
+                            self.returned_rows += 1;
                             bytes.set_remaining(slice.len());
                             polonius_return!(Poll::Ready(Ok(Some(value))))
                         }
@@ -164,6 +168,17 @@ impl<T> RowCursor<T> {
     #[inline]
     pub fn decoded_bytes(&self) -> u64 {
         self.raw.decoded_bytes()
+    }
+}
+
+impl<T> Drop for RowCursor<T> {
+    fn drop(&mut self) {
+        tracing::record_all!(
+            self.span,
+            db.response.returned_rows = self.returned_rows.0,
+            clickhouse.response.received_bytes = self.received_bytes(),
+            clickhouse.response.decoded_bytes = self.decoded_bytes(),
+        );
     }
 }
 
