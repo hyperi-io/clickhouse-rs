@@ -276,6 +276,9 @@ impl InsertFormatted {
             (to_u64_saturating(data.len()), data)
         };
 
+        #[cfg(not(feature = "lz4"))]
+        let original_size = to_u64_saturating(data.len());
+
         self.send_inner(data, original_size).await
     }
 
