@@ -1,8 +1,10 @@
-//! Native query builder — mirrors `crate::query::Query` for the native transport.
+//! Native query builder -- mirrors `crate::query::Query` for the native transport.
 
 use crate::error::{Error, Result};
+use crate::native::callbacks::QueryCallbacks;
 use crate::native::client::NativeClient;
 use crate::native::cursor::NativeRowCursor;
+use crate::native::protocol::{ProfileInfo, Progress};
 use crate::row::{RowOwned, RowRead};
 
 /// A query being built for native transport execution.
@@ -12,6 +14,14 @@ use crate::row::{RowOwned, RowRead};
 pub struct NativeQuery {
     client: NativeClient,
     sql: String,
+    /// Optional query ID sent in the query packet header.
+    ///
+    /// If `None`, an empty string is sent and the server generates its own ID.
+    query_id: Option<String>,
+    /// Per-query settings that override (or extend) the client-level settings.
+    settings: Vec<(String, String)>,
+    /// Observability callbacks invoked as packets arrive from the server.
+    callbacks: QueryCallbacks,
 }
 
 impl NativeQuery {
@@ -19,31 +29,147 @@ impl NativeQuery {
         Self {
             client,
             sql: sql.to_string(),
+            query_id: None,
+            settings: Vec::new(),
+            callbacks: QueryCallbacks::default(),
         }
     }
 
-    /// Bind a parameter using simple string substitution.
+    /// Set the query ID sent to the server in the query packet header.
     ///
-    /// Replaces the next `?` placeholder in the SQL string.
+    /// ClickHouse records this ID in `system.query_log` and returns it in
+    /// progress/profile packets.  If not set, an empty string is sent and the
+    /// server generates its own UUID.
+    pub fn with_query_id(mut self, id: impl Into<String>) -> Self {
+        self.query_id = Some(id.into());
+        self
+    }
+
+    /// Add per-query settings that override client-level settings for this
+    /// query only.
     ///
-    /// For production use, prefer parameterized queries with ClickHouse's
-    /// `{name: Type}` syntax via the HTTP client.
+    /// Settings are sent in the query packet and apply only to this query.
+    /// They are merged with (and take precedence over) any settings configured
+    /// on the [`NativeClient`] via [`NativeClient::with_setting`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use clickhouse::native::NativeClient;
+    /// # async fn example() -> clickhouse::error::Result<()> {
+    /// let client = NativeClient::default();
+    /// let rows = client
+    ///     .query("SELECT * FROM large_table")
+    ///     .with_settings([("max_rows_to_read", "1000000")])
+    ///     .fetch_all::<(u64,)>()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn with_settings(
+        mut self,
+        settings: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.settings
+            .extend(settings.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
+    /// Register a callback invoked for each [`Progress`] packet received.
+    ///
+    /// Progress packets are sent periodically by ClickHouse during query
+    /// execution and report rows/bytes read so far.  The callback is called
+    /// synchronously in the cursor's read loop; it must not block.
+    pub fn with_progress(mut self, f: impl Fn(&Progress) + Send + Sync + 'static) -> Self {
+        self.callbacks.on_progress = Some(Box::new(f));
+        self
+    }
+
+    /// Register a callback invoked when the server sends a [`ProfileInfo`] packet.
+    ///
+    /// ProfileInfo arrives once at the end of a SELECT result set and reports
+    /// final statistics (total rows, bytes, applied limits, etc.).  The
+    /// callback is called synchronously in the cursor's read loop; it must not
+    /// block.
+    pub fn with_profile_info(mut self, f: impl Fn(&ProfileInfo) + Send + Sync + 'static) -> Self {
+        self.callbacks.on_profile_info = Some(Box::new(f));
+        self
+    }
+
+    /// Bind a ClickHouse named parameter using the `{name:Type}` placeholder syntax.
+    ///
+    /// ClickHouse server-side named parameters use the syntax `{name:Type}` in
+    /// SQL.  These are sent as query settings
+    /// with the prefix `param_`.  For example, calling
+    /// `.param("id", 42u32)` adds the setting `param_id = "42"`, which
+    /// ClickHouse substitutes before executing the query.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use clickhouse::native::NativeClient;
+    /// # async fn example() -> clickhouse::error::Result<()> {
+    /// let client = NativeClient::default();
+    /// let rows = client
+    ///     .query("SELECT * FROM t WHERE id = {id:UInt32}")
+    ///     .param("id", 42u32)
+    ///     .fetch_all::<(u32,)>()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn param(mut self, name: &str, value: impl std::fmt::Display) -> Self {
+        let key = format!("param_{name}");
+        let val = value.to_string();
+        self.settings.push((key, val));
+        self
+    }
+
+    /// Bind a parameter using escaped string substitution.
+    ///
+    /// Replaces the next `?` placeholder in the SQL string with the
+    /// single-quote-escaped value. Backslashes, quotes, backticks, tabs,
+    /// and newlines are all escaped.
+    ///
+    /// For production use, prefer server-side parameter binding with
+    /// ClickHouse's `{name:Type}` syntax via [`.param()`](Self::param).
     pub fn bind(mut self, value: impl std::fmt::Display) -> Self {
         if let Some(pos) = self.sql.find('?') {
-            self.sql = format!(
-                "{}{}{}",
-                &self.sql[..pos],
-                value,
-                &self.sql[pos + 1..]
-            );
+            let raw = value.to_string();
+            let mut escaped = String::new();
+            // escape::string wraps in single quotes and escapes all special chars.
+            crate::sql::escape::string(&raw, &mut escaped)
+                .expect("fmt::Write on String is infallible");
+            self.sql = format!("{}{escaped}{}", &self.sql[..pos], &self.sql[pos + 1..]);
         }
         self
     }
 
+    /// Merge client-level settings with per-query settings.
+    ///
+    /// Per-query settings take precedence: if the same key appears in both,
+    /// the per-query value wins.
+    fn merged_settings(&self) -> Vec<(String, String)> {
+        if self.settings.is_empty() {
+            return self.client.settings().to_vec();
+        }
+        // Start with client-level settings, then override with per-query ones.
+        let mut merged: Vec<(String, String)> = self.client.settings().to_vec();
+        for (k, v) in &self.settings {
+            if let Some(existing) = merged.iter_mut().find(|(ek, _)| ek == k) {
+                existing.1 = v.clone();
+            } else {
+                merged.push((k.clone(), v.clone()));
+            }
+        }
+        merged
+    }
+
     /// Execute a DDL or non-SELECT query (CREATE, DROP, INSERT, etc.).
     pub async fn execute(self) -> Result<()> {
+        let query_id = self.query_id.as_deref().unwrap_or("");
+        let settings = self.merged_settings();
         let mut conn = self.client.acquire().await?;
-        conn.execute_query(&self.sql).await
+        conn.execute_query_with(query_id, &self.sql, &settings)
+            .await
     }
 
     /// Execute a SELECT query, returning a cursor over deserialized rows.
@@ -57,7 +183,7 @@ impl NativeQuery {
     /// Complex types (Array, Map, Tuple) are not yet supported.
     /// Execute a SELECT query, returning a cursor over deserialized rows.
     ///
-    /// `T` must be [`RowOwned`] — the deserialized value must not borrow from
+    /// `T` must be [`RowOwned`] -- the deserialized value must not borrow from
     /// the network buffer.
     ///
     /// # Type support
@@ -70,7 +196,15 @@ impl NativeQuery {
     where
         T: RowOwned + RowRead,
     {
-        Ok(NativeRowCursor::new(self.client, self.sql))
+        let query_id = self.query_id.clone().unwrap_or_default();
+        let settings = self.merged_settings();
+        Ok(NativeRowCursor::new(
+            self.client,
+            self.sql,
+            query_id,
+            settings,
+            self.callbacks,
+        ))
     }
 
     /// Fetch a single row.

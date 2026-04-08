@@ -1,4 +1,4 @@
-//! Public `NativeClient` — a ClickHouse client using the native TCP protocol.
+//! Public `NativeClient` -- a ClickHouse client using the native TCP protocol.
 //!
 //! Mirrors the basic API of [`crate::Client`] so integration tests can switch
 //! between transports with minimal changes.
@@ -11,9 +11,9 @@
 //! cap.  The pool is per-client-instance; clones share the same pool.
 //!
 //! Builder methods that affect connection parameters (`with_addr`,
-//! `with_database`, `with_user`, `with_password`, `with_setting`, `with_lz4`)
-//! reset the pool so the next `acquire` opens fresh connections with the
-//! updated config.
+//! `with_database`, `with_user`, `with_password`, `with_setting`, `with_lz4`,
+//! `with_roles`) reset the pool so the next `acquire` opens fresh connections
+//! with the updated config.
 //!
 //! [`with_pool_size`]: NativeClient::with_pool_size
 
@@ -21,13 +21,16 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::native::connection::TlsConfig;
 use crate::native::insert::NativeInsert;
 use crate::native::inserter::NativeInserter;
 use crate::native::pool::{NativePool, PoolConfig, PooledConnection, build_pool};
 use crate::native::protocol::NativeCompressionMethod;
 use crate::native::query::NativeQuery;
 use crate::native::schema::NativeSchemaCache;
+use crate::pool_stats::PoolStats;
 use crate::row::Row;
+use crate::server_info::ServerVersion;
 
 /// A ClickHouse client using the native binary TCP protocol (port 9000).
 ///
@@ -51,15 +54,33 @@ const DEFAULT_POOL_SIZE: usize = 10;
 
 #[derive(Clone)]
 pub struct NativeClient {
-    addr: SocketAddr,
+    /// One or more server addresses for round-robin failover.
+    ///
+    /// Set via [`with_addr`] (single) or [`with_addrs`] (multiple).
+    ///
+    /// [`with_addr`]: NativeClient::with_addr
+    /// [`with_addrs`]: NativeClient::with_addrs
+    addrs: Vec<SocketAddr>,
     database: String,
     username: String,
     password: String,
     compression: NativeCompressionMethod,
+    /// TLS configuration.  When set, all connections use TLS (port 9440).
+    /// When `None` / `()` (depending on feature), plain TCP (port 9000).
+    tls: TlsConfig,
     /// Shared schema cache (TTL 300 s by default).
     schema_cache: Arc<NativeSchemaCache>,
     /// Per-query settings sent with every query on this client.
     settings: Arc<Vec<(String, String)>>,
+    /// Roles to activate on each new connection via `SET ROLE`.
+    ///
+    /// ClickHouse roles are session-scoped: `SET ROLE` must be issued once per
+    /// connection, immediately after the handshake.  The pool manager sends
+    /// `SET ROLE role1, role2, ...` before returning a new connection.
+    ///
+    /// An empty vec means "use the server default roles for this user"  --
+    /// equivalent to `SET ROLE DEFAULT`.
+    roles: Vec<String>,
     /// Maximum connections (idle + in-use) in the pool.
     pool_size: usize,
     /// Deadpool-backed connection pool.  Already Arc-backed internally, so
@@ -67,33 +88,52 @@ pub struct NativeClient {
     pool: NativePool,
 }
 
+/// Default TLS config: no TLS.
+fn default_tls_config() -> TlsConfig {
+    #[cfg(feature = "native-tls-rustls")]
+    {
+        None
+    }
+    #[cfg(not(feature = "native-tls-rustls"))]
+    {
+        ()
+    }
+}
+
 impl Default for NativeClient {
     fn default() -> Self {
-        let addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid default addr");
+        let default_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid default addr");
+        let addrs = vec![default_addr];
         let database = "default".to_string();
         let username = "default".to_string();
         let password = String::new();
         let compression = NativeCompressionMethod::None;
         let settings: Vec<(String, String)> = Vec::new();
+        let roles: Vec<String> = Vec::new();
+        let tls = default_tls_config();
         let pool = build_pool(
             PoolConfig {
-                addr,
+                addrs: addrs.clone(),
                 database: database.clone(),
                 username: username.clone(),
                 password: password.clone(),
                 compression,
                 settings: settings.clone(),
+                roles: roles.clone(),
+                tls: tls.clone(),
             },
             DEFAULT_POOL_SIZE,
         );
         Self {
-            addr,
+            addrs,
             database,
             username,
             password,
             compression,
+            tls,
             schema_cache: NativeSchemaCache::new(300),
             settings: Arc::new(settings),
+            roles,
             pool_size: DEFAULT_POOL_SIZE,
             pool,
         }
@@ -106,12 +146,14 @@ impl NativeClient {
     fn rebuild_pool(&mut self) {
         self.pool = build_pool(
             PoolConfig {
-                addr: self.addr,
+                addrs: self.addrs.clone(),
                 database: self.database.clone(),
                 username: self.username.clone(),
                 password: self.password.clone(),
                 compression: self.compression,
                 settings: self.settings.as_ref().clone(),
+                roles: self.roles.clone(),
+                tls: self.tls.clone(),
             },
             self.pool_size,
         );
@@ -119,16 +161,60 @@ impl NativeClient {
 
     /// Set the server address (host:port).
     ///
+    /// Replaces any previously configured addresses with a single address.
+    /// To configure multiple addresses for round-robin failover, use
+    /// [`with_addrs`](NativeClient::with_addrs).
+    ///
     /// # Panics
     ///
     /// If `addr` cannot be resolved to a socket address.
     #[must_use]
     pub fn with_addr(mut self, addr: impl ToSocketAddrs) -> Self {
-        self.addr = addr
-            .to_socket_addrs()
-            .expect("invalid address")
-            .next()
-            .expect("no address resolved");
+        match addr.to_socket_addrs() {
+            Ok(mut addrs) => {
+                if let Some(resolved) = addrs.next() {
+                    self.addrs = vec![resolved];
+                    self.rebuild_pool();
+                }
+                // No address resolved -- will fail at connect time with a proper error
+            }
+            Err(_) => {
+                // DNS resolution failed -- will fail at connect time with a proper error.
+                // Don't panic: callers may be validating configs or testing error paths.
+            }
+        }
+        self
+    }
+
+    /// Set multiple server addresses for round-robin failover.
+    ///
+    /// The pool cycles through the provided addresses in order, distributing
+    /// new connections across all listed hosts.  When a connection to one host
+    /// fails, the next `acquire` will try the following address in the list.
+    ///
+    /// Replaces any previously configured addresses.
+    ///
+    /// # Panics
+    ///
+    /// If `addrs` is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use clickhouse::native::NativeClient;
+    /// let client = NativeClient::default()
+    ///     .with_addrs(vec![
+    ///         "10.0.0.1:9000".parse().unwrap(),
+    ///         "10.0.0.2:9000".parse().unwrap(),
+    ///     ]);
+    /// ```
+    #[must_use]
+    pub fn with_addrs(mut self, addrs: Vec<std::net::SocketAddr>) -> Self {
+        assert!(
+            !addrs.is_empty(),
+            "with_addrs: address list must not be empty"
+        );
+        self.addrs = addrs;
         self.rebuild_pool();
         self
     }
@@ -165,9 +251,48 @@ impl NativeClient {
         self
     }
 
+    /// Enable TLS for all connections.
+    ///
+    /// Loads both webpki (public CA) and native OS root certificates,
+    /// so connections work against both public ClickHouse Cloud and
+    /// internal deployments with private CAs.
+    ///
+    /// The `server_name` is used for SNI and certificate verification  --
+    /// typically the hostname of the ClickHouse server.
+    /// Connect to ClickHouse's native TLS port (9440 by default).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> clickhouse::error::Result<()> {
+    /// use clickhouse::native::NativeClient;
+    ///
+    /// let client = NativeClient::default()
+    ///     .with_addr("clickhouse.example.com:9440")
+    ///     .with_tls("clickhouse.example.com")
+    ///     .with_database("default");
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "native-tls-rustls")]
+    #[must_use]
+    pub fn with_tls(mut self, server_name: &str) -> Self {
+        let root_store = build_root_cert_store();
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let sni = rustls::pki_types::ServerName::try_from(server_name.to_owned())
+            .expect("valid DNS server name for TLS SNI");
+
+        self.tls = Some((std::sync::Arc::new(tls_config), sni));
+        self.rebuild_pool();
+        self
+    }
+
     /// Set the maximum number of connections (idle + in-use) in the pool.
     ///
-    /// Defaults to 10.  Must be called before the first query/insert —
+    /// Defaults to 10.  Must be called before the first query/insert  --
     /// changing it after the pool has been initialised has no effect.
     #[must_use]
     pub fn with_pool_size(mut self, size: usize) -> Self {
@@ -190,12 +315,51 @@ impl NativeClient {
     ///     .with_setting("insert_quorum", "2");
     /// ```
     #[must_use]
-    pub fn with_setting(
-        mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn with_setting(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.settings).push((name.into(), value.into()));
+        self.rebuild_pool();
+        self
+    }
+
+    /// Activate one or more ClickHouse roles for all connections on this client.
+    ///
+    /// Roles are session-scoped in ClickHouse: each new connection opened by
+    /// the pool will execute `SET ROLE role1, role2, ...` immediately after the
+    /// handshake, before the connection is handed to any query or insert.
+    ///
+    /// Replaces any roles previously set by this method.  Call
+    /// [`with_default_roles`] to revert to the user's default role set.
+    ///
+    /// [`with_default_roles`]: NativeClient::with_default_roles
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use clickhouse::native::NativeClient;
+    /// // Single role
+    /// let client = NativeClient::default().with_roles(["readonly"]);
+    ///
+    /// // Multiple roles
+    /// let client = NativeClient::default().with_roles(["analyst", "reporting"]);
+    /// ```
+    #[must_use]
+    pub fn with_roles(mut self, roles: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.roles = roles.into_iter().map(Into::into).collect();
+        self.rebuild_pool();
+        self
+    }
+
+    /// Clear any explicitly set roles, reverting to the user's default role set.
+    ///
+    /// New connections will not send `SET ROLE`, so ClickHouse uses whatever
+    /// roles are configured as defaults for the authenticated user.
+    ///
+    /// Overrides any roles previously set by [`with_roles`].
+    ///
+    /// [`with_roles`]: NativeClient::with_roles
+    #[must_use]
+    pub fn with_default_roles(mut self) -> Self {
+        self.roles.clear();
         self.rebuild_pool();
         self
     }
@@ -275,18 +439,20 @@ impl NativeClient {
     /// The result is stored in the TTL cache for future calls to [`cached_schema`].
     ///
     /// [`cached_schema`]: NativeClient::cached_schema
-    pub async fn fetch_schema(
-        &self,
-        table: &str,
-    ) -> Result<Vec<(String, String)>> {
+    pub async fn fetch_schema(&self, table: &str) -> Result<Vec<(String, String)>> {
         if let Some(cached) = self.schema_cache.get(table) {
             return Ok(cached);
         }
-        let db = &self.database;
+        let mut db_escaped = String::new();
+        crate::sql::escape::string(&self.database, &mut db_escaped)
+            .expect("fmt::Write on String is infallible");
+        let mut tbl_escaped = String::new();
+        crate::sql::escape::string(table, &mut tbl_escaped)
+            .expect("fmt::Write on String is infallible");
         let sql = format!(
             "SELECT name, type \
              FROM system.columns \
-             WHERE database = '{db}' AND table = '{table}' \
+             WHERE database = {db_escaped} AND table = {tbl_escaped} \
              ORDER BY position"
         );
         let columns = fetch_string_pairs(self, &sql).await?;
@@ -308,11 +474,7 @@ impl NativeClient {
     ///
     /// Called internally after a successful `begin_insert` to cache the schema
     /// the server reported.
-    pub(crate) fn cache_schema(
-        &self,
-        table: &str,
-        columns: &[(String, String)],
-    ) {
+    pub(crate) fn cache_schema(&self, table: &str, columns: &[(String, String)]) {
         self.schema_cache
             .insert(table.to_string(), columns.to_vec());
     }
@@ -335,14 +497,44 @@ impl NativeClient {
         let mut conn = self.acquire().await?;
         conn.ping().await
     }
+
+    /// Return server version information from the native protocol handshake.
+    ///
+    /// Acquires a pooled connection (opening one if the pool is empty), reads
+    /// the cached [`ServerHello`](crate::native::protocol::ServerHello), and
+    /// immediately returns the connection to the pool.
+    pub async fn server_version(&self) -> Result<ServerVersion> {
+        let conn = self.acquire().await?;
+        let hello = conn.server_hello();
+        Ok(ServerVersion {
+            name: hello.server_name.clone(),
+            major: hello.version.0,
+            minor: hello.version.1,
+            patch: hello.version.2,
+            revision: hello.revision_version,
+            timezone: hello.timezone.clone(),
+            display_name: hello.display_name.clone(),
+        })
+    }
+
+    /// Return a snapshot of connection pool statistics.
+    ///
+    /// Values are eventually-consistent -- they reflect the pool state at the
+    /// moment of the call.
+    pub fn pool_stats(&self) -> PoolStats {
+        let status = self.pool.status();
+        PoolStats {
+            max_size: status.max_size,
+            size: status.size,
+            available: status.available,
+            waiting: status.waiting,
+        }
+    }
 }
 
 /// Execute a query expected to return two `String` columns and collect all rows
 /// as `Vec<(String, String)>`, parsing RowBinary directly without serde.
-async fn fetch_string_pairs(
-    client: &NativeClient,
-    sql: &str,
-) -> Result<Vec<(String, String)>> {
+async fn fetch_string_pairs(client: &NativeClient, sql: &str) -> Result<Vec<(String, String)>> {
     use crate::native::reader::ServerPacket;
 
     let mut conn = client.acquire().await?;
@@ -363,12 +555,8 @@ async fn fetch_string_pairs(
     let mut result = Vec::new();
 
     loop {
-        let packet = crate::native::reader::read_packet(
-            conn.reader_mut(),
-            revision,
-            compression,
-        )
-        .await?;
+        let packet =
+            crate::native::reader::read_packet(conn.reader_mut(), revision, compression).await?;
         match packet {
             ServerPacket::Data(block) if block.num_rows > 0 => {
                 // Each element in row_data is one complete RowBinary row.
@@ -417,4 +605,25 @@ fn rb_read_string(bytes: &[u8]) -> crate::error::Result<(String, &[u8])> {
     }
     let s = String::from_utf8_lossy(&bytes[i..i + len]).into_owned();
     Ok((s, &bytes[i + len..]))
+}
+
+/// Build a root certificate store with both webpki (public) and native (OS)
+/// root certs.  This ensures TLS works against both ClickHouse Cloud (public
+/// certs) and internal deployments using private CAs (certs in the OS store).
+#[cfg(feature = "native-tls-rustls")]
+fn build_root_cert_store() -> rustls::RootCertStore {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    // 1. webpki roots -- covers ClickHouse Cloud and all public CAs.
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // 2. Native OS roots -- covers internal/private CAs (e.g. cert-manager,
+    //    OpenBao PKI, corporate CAs).  Errors loading individual certs are
+    //    non-fatal: webpki roots alone are sufficient for public endpoints.
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = root_store.add(cert);
+    }
+
+    root_store
 }

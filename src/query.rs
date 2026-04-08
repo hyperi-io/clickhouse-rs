@@ -152,7 +152,7 @@ impl Query {
         let query = self.sql.finish()?;
 
         let mut url =
-            Url::parse(&self.client.url).map_err(|err| Error::InvalidParams(Box::new(err)))?;
+            Url::parse(self.client.pick_url()).map_err(|err| Error::InvalidParams(Box::new(err)))?;
         let mut pairs = url.query_pairs_mut();
         pairs.clear();
 
@@ -222,6 +222,41 @@ impl Query {
     /// Similar to [`Client::with_option`], but for this particular query only.
     pub fn with_option(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.client.set_option(name, value);
+        self
+    }
+
+    /// Set the server-side query ID for this query.
+    ///
+    /// Useful for tracing queries in system.query_log and for cancellation
+    /// via `KILL QUERY WHERE query_id = '...'`.
+    ///
+    /// ClickHouse accepts `query_id` as a URL parameter in the HTTP interface.
+    pub fn with_query_id(self, query_id: impl Into<String>) -> Self {
+        self.with_option("query_id", query_id)
+    }
+
+    /// Set per-query ClickHouse settings.
+    ///
+    /// Overrides client-level settings for this query only.  Each setting is
+    /// passed as a URL parameter in the HTTP interface.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn example() {
+    /// # let client = clickhouse::Client::default();
+    /// client.query("SELECT ...")
+    ///     .with_settings([("max_threads", "4"), ("max_memory_usage", "1000000000")])
+    ///     .execute();
+    /// # }
+    /// ```
+    pub fn with_settings<'a>(
+        mut self,
+        settings: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        for (k, v) in settings {
+            self.client.set_option(k.to_owned(), v.to_owned());
+        }
         self
     }
 

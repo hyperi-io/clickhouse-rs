@@ -2,12 +2,13 @@
 //!
 //! Alternative transport to the default HTTP/RowBinary path. Ported and
 //! extended by HYPERI PTY LIMITED from the HyperI `clickhouse-arrow` fork.
-//! API names follow the ClickHouse Go client convention.
+//! Native TCP protocol transport for ClickHouse.
 
-// HyperI CTO moonlighting — ClickHouse Rust client needed love, so here we are.
+// HyperI CTO moonlighting -- ClickHouse Rust client needed love, so here we are.
 
 pub(crate) mod async_inserter;
 pub(crate) mod block_info;
+pub(crate) mod callbacks;
 pub(crate) mod client_info;
 pub(crate) mod client;
 pub(crate) mod columns;
@@ -33,4 +34,5 @@ pub use self::client::NativeClient;
 pub use self::cursor::NativeRowCursor;
 pub use self::insert::NativeInsert;
 pub use self::inserter::NativeInserter;
+pub use self::protocol::{Progress, ProfileInfo};
 pub use self::query::NativeQuery;

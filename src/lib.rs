@@ -7,6 +7,7 @@ pub use self::{
 };
 use self::{error::Result, http_client::HttpClient};
 use crate::row_metadata::{AccessType, ColumnDefaultKind, InsertMetadata, RowMetadata};
+use crate::server_info::ServerVersion;
 
 #[doc = include_str!("row_derive.md")]
 pub use clickhouse_macros::Row;
@@ -14,18 +15,21 @@ use clickhouse_types::{Column, DataTypeNode};
 
 use crate::_priv::row_insert_metadata_query;
 use std::collections::HashSet;
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{fmt::Display, sync::Arc};
+
+use rustc_hash::FxHashMap;
 use tokio::sync::RwLock;
 
+#[cfg(feature = "async-inserter")]
+pub mod async_inserter;
+#[cfg(feature = "batcher")]
+pub mod batcher;
 pub mod error;
 pub mod insert;
 pub mod insert_formatted;
 #[cfg(feature = "inserter")]
 pub mod inserter;
-#[cfg(feature = "async-inserter")]
-pub mod async_inserter;
-#[cfg(feature = "batcher")]
-pub mod batcher;
 pub mod query;
 pub mod serde;
 pub mod sql;
@@ -39,18 +43,28 @@ mod compression;
 mod cursors;
 mod headers;
 mod http_client;
+pub mod quantities;
 mod request_body;
 mod response;
 mod row;
 mod row_metadata;
 mod rowbinary;
-#[cfg(feature = "inserter")]
-mod ticks;
+#[cfg(any(feature = "inserter", feature = "native-transport"))]
+pub(crate) mod ticks;
 
 #[cfg(feature = "native-transport")]
 pub mod native;
 
 pub mod dynamic;
+
+pub mod pool_stats;
+pub mod server_info;
+pub mod unified;
+pub mod unified_cursor;
+pub mod unified_insert;
+pub mod unified_query;
+pub use pool_stats::PoolStats;
+pub use unified::{Transport, UnifiedClient};
 
 /// A client containing HTTP pool.
 ///
@@ -59,17 +73,32 @@ pub mod dynamic;
 /// Any `with_*` configuration method (e.g., [`Client::with_option`]) applies
 /// only to future clones, because [`Client::clone`] creates a deep copy
 /// of the [`Client`] configuration, except the transport.
+///
+/// The round-robin URL counter (`next_url_index`) is shared across clones so
+/// that all copies of a client advance through the same host rotation.
 #[derive(Clone)]
 pub struct Client {
     http: Arc<dyn HttpClient>,
 
-    url: String,
+    /// The ordered list of ClickHouse HTTP endpoints.
+    ///
+    /// Always contains at least one entry after [`Client::with_url`] or
+    /// [`Client::with_urls`] is called. May be empty for a default-constructed
+    /// client that has not yet had a URL set (preserving backwards compat).
+    urls: Vec<String>,
+
+    /// Shared counter for round-robin URL selection across all clones.
+    ///
+    /// `Arc` so that all clones advance the same counter; `AtomicUsize` so
+    /// that there is no lock contention on the hot path.
+    next_url_index: Arc<AtomicUsize>,
+
     database: Option<String>,
     authentication: Authentication,
     compression: Compression,
     roles: HashSet<String>,
-    options: HashMap<String, String>,
-    headers: HashMap<String, String>,
+    options: FxHashMap<String, String>,
+    headers: FxHashMap<String, String>,
     products_info: Vec<ProductInfo>,
     validation: bool,
     insert_metadata_cache: Arc<InsertMetadataCache>,
@@ -91,7 +120,7 @@ impl Display for ProductInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum Authentication {
     Credentials {
         user: Option<String>,
@@ -100,6 +129,23 @@ pub(crate) enum Authentication {
     Jwt {
         access_token: String,
     },
+}
+
+// Manual Debug impl to redact secrets from log/panic output.
+impl std::fmt::Debug for Authentication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Credentials { user, .. } => f
+                .debug_struct("Credentials")
+                .field("user", user)
+                .field("password", &"[REDACTED]")
+                .finish(),
+            Self::Jwt { .. } => f
+                .debug_struct("Jwt")
+                .field("access_token", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 impl Default for Authentication {
@@ -120,7 +166,7 @@ impl Default for Client {
 /// Cache for [`RowMetadata`] to avoid allocating it for the same struct more than once
 /// during the application lifecycle. Key: fully qualified table name (e.g. `database.table`).
 #[derive(Default)]
-pub(crate) struct InsertMetadataCache(RwLock<HashMap<String, Arc<InsertMetadata>>>);
+pub(crate) struct InsertMetadataCache(RwLock<FxHashMap<String, Arc<InsertMetadata>>>);
 
 impl Client {
     /// Creates a new client with a specified underlying HTTP client.
@@ -129,19 +175,20 @@ impl Client {
     pub fn with_http_client(client: impl HttpClient) -> Self {
         Self {
             http: Arc::new(client),
-            url: String::new(),
+            urls: Vec::new(),
+            next_url_index: Arc::new(AtomicUsize::new(0)),
             database: None,
             authentication: Authentication::default(),
             compression: Compression::default(),
             roles: HashSet::new(),
-            options: HashMap::new(),
-            headers: HashMap::new(),
+            options: FxHashMap::default(),
+            headers: FxHashMap::default(),
             products_info: Vec::default(),
             validation: true,
             insert_metadata_cache: Arc::new(InsertMetadataCache::default()),
-            dynamic_schema_cache: dynamic::DynamicSchemaCache::new(
-                std::time::Duration::from_secs(300),
-            ),
+            dynamic_schema_cache: dynamic::DynamicSchemaCache::new(std::time::Duration::from_secs(
+                300,
+            )),
             #[cfg(feature = "test-util")]
             mocked: false,
         }
@@ -158,15 +205,52 @@ impl Client {
     /// let client = Client::default().with_url("http://localhost:8123");
     /// ```
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
-        self.url = url.into();
+        let mut url = url.into();
 
         // `with_mock()` didn't exist previously, so to not break existing usages,
         // we need to be able to detect a mocked server using nothing but the URL.
         #[cfg(feature = "test-util")]
-        if let Some(url) = test::Mock::mocked_url_to_real(&self.url) {
-            self.url = url;
+        if let Some(real_url) = test::Mock::mocked_url_to_real(&url) {
+            url = real_url;
             self.mocked = true;
         }
+
+        self.urls = vec![url];
+
+        // Assume our cached metadata is invalid.
+        self.insert_metadata_cache = Default::default();
+
+        self
+    }
+
+    /// Specifies multiple ClickHouse HTTP endpoints for round-robin failover.
+    ///
+    /// On each request the client picks the next URL from the list using a
+    /// shared atomic counter, cycling through the hosts in order. This provides
+    /// simple load distribution across a set of ClickHouse nodes.
+    ///
+    /// All clones of the client share the same counter so the rotation is
+    /// co-ordinated across copies.
+    ///
+    /// Automatically [clears the metadata cache][Self::clear_cached_metadata]
+    /// for this instance only.
+    ///
+    /// # Panics
+    ///
+    /// If `urls` is empty.
+    ///
+    /// # Examples
+    /// ```
+    /// # use clickhouse::Client;
+    /// let client = Client::default().with_urls(vec![
+    ///     "http://ch-1:8123".to_string(),
+    ///     "http://ch-2:8123".to_string(),
+    ///     "http://ch-3:8123".to_string(),
+    /// ]);
+    /// ```
+    pub fn with_urls(mut self, urls: Vec<String>) -> Self {
+        assert!(!urls.is_empty(), "with_urls: URL list must not be empty");
+        self.urls = urls;
 
         // Assume our cached metadata is invalid.
         self.insert_metadata_cache = Default::default();
@@ -472,7 +556,7 @@ impl Client {
     ///
     /// Fetches the schema from `system.columns` (cached with TTL) and encodes
     /// `Map<String, Value>` to RowBinary. As simple as JSONEachRow to use, but
-    /// ClickHouse skips JSON parsing entirely — significant CPU savings on the
+    /// ClickHouse skips JSON parsing entirely -- significant CPU savings on the
     /// cluster at scale.
     ///
     /// # Example
@@ -483,17 +567,10 @@ impl Client {
     /// insert.write_map(&row2).await?;
     /// let rows_written = insert.end().await?;
     /// ```
-    pub fn dynamic_insert(
-        &self,
-        database: &str,
-        table: &str,
-    ) -> dynamic::insert::DynamicInsert {
-        dynamic::insert::DynamicInsert::new(
-            self.clone(),
-            database.to_string(),
-            table.to_string(),
-            self.dynamic_schema_cache.clone(),
-        )
+    pub fn dynamic_insert(&self, database: &str, table: &str) -> dynamic::insert::DynamicInsert {
+        let unified =
+            crate::unified::UnifiedClient::new(crate::unified::Transport::Http(self.clone()));
+        unified.dynamic_insert(database, table)
     }
 
     /// Start an async auto-flushing dynamic batcher for a table.
@@ -516,7 +593,9 @@ impl Client {
         table: &str,
         config: dynamic::DynamicBatchConfig,
     ) -> dynamic::DynamicBatcher {
-        dynamic::DynamicBatcher::new(self, database, table, config)
+        let unified =
+            crate::unified::UnifiedClient::new(crate::unified::Transport::Http(self.clone()));
+        unified.dynamic_batcher(database, table, config)
     }
 
     /// Starts a new SELECT/DDL query.
@@ -554,6 +633,57 @@ impl Client {
     pub fn with_validation(mut self, enabled: bool) -> Self {
         self.validation = enabled;
         self
+    }
+
+    /// Checks connectivity to the ClickHouse server.
+    ///
+    /// Executes `SELECT 1` and discards the result. Returns `Ok(())` if the
+    /// server responds successfully, or an error if the connection fails or the
+    /// server returns an exception.
+    ///
+    /// Works with all ClickHouse deployments including those behind HTTP proxies
+    /// that may not forward the `/ping` endpoint.
+    pub async fn ping(&self) -> Result<()> {
+        self.query("SELECT 1").execute().await
+    }
+
+    /// Returns version information for the connected ClickHouse server.
+    ///
+    /// Executes `SELECT version(), timezone()` and parses the result into a
+    /// [`ServerVersion`]. The version string is expected in the format returned
+    /// by ClickHouse: `"major.minor.patch.revision"` (e.g. `"24.3.1.123"`).
+    ///
+    /// `display_name` is always `None` for the HTTP transport -- the server
+    /// display name is only available via the native TCP handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server is unreachable, the query fails, or the
+    /// version string cannot be parsed.
+    pub async fn server_version(&self) -> Result<ServerVersion> {
+        let (version_str, timezone): (String, String) = self
+            .query("SELECT version(), timezone()")
+            .fetch_one()
+            .await?;
+
+        // Parse "major.minor.patch.revision" -- ClickHouse always emits all
+        // four components. Any missing component defaults to 0 so that future
+        // format changes degrade gracefully rather than returning an error.
+        let mut parts = version_str.splitn(4, '.');
+        let major = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        let minor = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        let patch = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+        let revision = parts.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+
+        Ok(ServerVersion {
+            name: "ClickHouse".to_string(),
+            major,
+            minor,
+            patch,
+            revision,
+            timezone: Some(timezone),
+            display_name: None,
+        })
     }
 
     /// Clear table metadata that was previously received and cached.
@@ -604,9 +734,30 @@ impl Client {
     /// which is pointless in that kind of tests.
     #[cfg(feature = "test-util")]
     pub fn with_mock(mut self, mock: &test::Mock) -> Self {
-        self.url = mock.real_url().to_string();
+        self.urls = vec![mock.real_url().to_string()];
         self.mocked = true;
         self
+    }
+
+    /// Pick the next URL from the round-robin list.
+    ///
+    /// If only one URL is configured the counter is never incremented -- no
+    /// unnecessary atomic write on the hot path. If no URL has been configured
+    /// (default-constructed client) an empty string is returned, matching the
+    /// original behaviour of the unset `url: String` field.
+    #[inline]
+    pub(crate) fn pick_url(&self) -> &str {
+        match self.urls.len() {
+            0 => "",
+            1 => &self.urls[0],
+            n => {
+                // Relaxed ordering is fine here: we only need the counter to
+                // advance monotonically across calls; there is no dependent
+                // memory that needs to be synchronised alongside this load.
+                let idx = self.next_url_index.fetch_add(1, Ordering::Relaxed);
+                &self.urls[idx % n]
+            }
+        }
     }
 
     async fn get_insert_metadata(&self, table_name: &str) -> Result<Arc<InsertMetadata>> {
@@ -632,7 +783,7 @@ impl Client {
 
         let mut columns = Vec::new();
         let mut column_default_kinds = Vec::new();
-        let mut column_lookup = HashMap::new();
+        let mut column_lookup = rustc_hash::FxHashMap::default();
 
         while let Some((name, type_, default_kind)) = columns_cursor.next().await? {
             let data_type = DataTypeNode::new(&type_)?;

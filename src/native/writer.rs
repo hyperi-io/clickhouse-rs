@@ -10,13 +10,13 @@ use crate::native::client_info::ClientInfo;
 use crate::native::compression::compress_data;
 use crate::native::io::ClickHouseWrite;
 use crate::native::protocol::{
-    ClientPacketId, NativeCompressionMethod, QueryProcessingStage, ServerHello,
-    DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS,
+    ClientPacketId, DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS,
     DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES,
     DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS, DBMS_MIN_PROTOCOL_VERSION_WITH_QUOTA_KEY,
     DBMS_MIN_REVISION_WITH_CLIENT_INFO, DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET,
     DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL,
-    DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION, DBMS_TCP_PROTOCOL_VERSION,
+    DBMS_PARALLEL_REPLICAS_PROTOCOL_VERSION, DBMS_TCP_PROTOCOL_VERSION, NativeCompressionMethod,
+    QueryProcessingStage, ServerHello,
 };
 
 /// Send client hello packet.
@@ -26,9 +26,7 @@ pub(crate) async fn send_hello<W: ClickHouseWrite>(
     username: &str,
     password: &str,
 ) -> Result<()> {
-    writer
-        .write_var_uint(ClientPacketId::Hello as u64)
-        .await?;
+    writer.write_var_uint(ClientPacketId::Hello as u64).await?;
     writer
         .write_string(format!(
             "clickhouse-rs native {}",
@@ -38,9 +36,7 @@ pub(crate) async fn send_hello<W: ClickHouseWrite>(
     // Client version (major, minor, revision)
     writer.write_var_uint(0).await?; // major
     writer.write_var_uint(14).await?; // minor
-    writer
-        .write_var_uint(DBMS_TCP_PROTOCOL_VERSION)
-        .await?;
+    writer.write_var_uint(DBMS_TCP_PROTOCOL_VERSION).await?;
     writer.write_string(database).await?;
     writer.write_string(username).await?;
     writer.write_string(password).await?;
@@ -57,9 +53,7 @@ pub(crate) async fn send_query<W: ClickHouseWrite>(
     revision: u64,
     compression: NativeCompressionMethod,
 ) -> Result<()> {
-    writer
-        .write_var_uint(ClientPacketId::Query as u64)
-        .await?;
+    writer.write_var_uint(ClientPacketId::Query as u64).await?;
     writer.write_string(query_id).await?;
 
     if revision >= DBMS_MIN_REVISION_WITH_CLIENT_INFO {
@@ -67,13 +61,20 @@ pub(crate) async fn send_query<W: ClickHouseWrite>(
         info.write(writer, revision).await?;
     }
 
-    // Settings: (name, is_important u8, value) per entry, terminated by empty name.
+    // Settings: (name, flags_varuint, value) per entry, terminated by empty name.
+    // Only non-param_ settings go here. param_ entries are sent as Parameters
+    // after the query body (revision >= 54459).
+    const FLAG_IMPORTANT: u8 = 0x01;
+
     for (name, value) in settings {
+        if name.starts_with("param_") {
+            continue; // sent later as Parameters
+        }
         writer.write_string(name).await?;
-        writer.write_u8(0).await?; // not important
+        writer.write_u8(FLAG_IMPORTANT).await?;
         writer.write_string(value).await?;
     }
-    writer.write_string("").await?; // end marker
+    writer.write_string("").await?; // end of settings
 
     if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES {
         writer.write_string("").await?;
@@ -93,8 +94,28 @@ pub(crate) async fn send_query<W: ClickHouseWrite>(
 
     writer.write_string(query).await?;
 
+    // Parameters (revision >= 54459): sent AFTER the query body as a separate
+    // block. Each parameter is (bare_name, FLAG_CUSTOM, field_dump_value).
+    //
+    // On the native wire, parameter keys use the BARE name ("val"), not the
+    // prefixed form ("param_val"). The "param_" prefix is HTTP-only (URL params).
+    // We store them with the prefix internally (same as .param() builder), so
+    // strip it here before sending.
     if revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS {
-        writer.write_string("").await?; // end of params
+        const FLAG_CUSTOM: u8 = 0x02;
+        for (name, value) in settings {
+            if !name.starts_with("param_") {
+                continue; // already sent as settings above
+            }
+            let bare_name = &name["param_".len()..];
+            writer.write_string(bare_name).await?;
+            writer.write_u8(FLAG_CUSTOM).await?;
+            let mut escaped = String::new();
+            crate::sql::escape::string(value, &mut escaped)
+                .expect("fmt::Write on String is infallible");
+            writer.write_string(&escaped).await?;
+        }
+        writer.write_string("").await?; // end of parameters
     }
 
     writer.flush().await?;
@@ -109,9 +130,7 @@ pub(crate) async fn send_empty_block<W: ClickHouseWrite>(
     writer: &mut W,
     compression: NativeCompressionMethod,
 ) -> Result<()> {
-    writer
-        .write_var_uint(ClientPacketId::Data as u64)
-        .await?;
+    writer.write_var_uint(ClientPacketId::Data as u64).await?;
     writer.write_string("").await?; // table name (always uncompressed)
 
     if matches!(compression, NativeCompressionMethod::None) {
@@ -175,9 +194,7 @@ pub(crate) async fn send_data_block<W: ClickHouseWrite>(
     column_bytes: &[u8],
     compression: NativeCompressionMethod,
 ) -> Result<()> {
-    writer
-        .write_var_uint(ClientPacketId::Data as u64)
-        .await?;
+    writer.write_var_uint(ClientPacketId::Data as u64).await?;
     writer.write_string("").await?; // temp table name (always uncompressed)
 
     if matches!(compression, NativeCompressionMethod::None) {
@@ -201,9 +218,7 @@ pub(crate) async fn send_data_block<W: ClickHouseWrite>(
 
 /// Send ping.
 pub(crate) async fn send_ping<W: ClickHouseWrite>(writer: &mut W) -> Result<()> {
-    writer
-        .write_var_uint(ClientPacketId::Ping as u64)
-        .await?;
+    writer.write_var_uint(ClientPacketId::Ping as u64).await?;
     writer.flush().await?;
     Ok(())
 }

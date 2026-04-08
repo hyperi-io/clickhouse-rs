@@ -1,27 +1,39 @@
 //! Connection management for ClickHouse native TCP protocol.
 //!
-//! Single-connection MVP — handles handshake, query execution, and packet
+//! Single-connection MVP -- handles handshake, query execution, and packet
 //! reading over a buffered TCP stream.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, BufReader, BufWriter, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::native::protocol::{
-    ChunkedProtocolMode, NativeCompressionMethod, ServerHello, DBMS_TCP_PROTOCOL_VERSION,
+    ChunkedProtocolMode, DBMS_TCP_PROTOCOL_VERSION, NativeCompressionMethod, ServerHello,
 };
 use crate::native::reader::{self, ServerPacket};
-use crate::native::tcp::{self, CONN_READ_BUFFER, CONN_WRITE_BUFFER};
+use crate::native::tcp::{self, CONN_READ_BUFFER, CONN_WRITE_BUFFER, MaybeTlsStream};
 use crate::native::writer;
+
+/// TLS configuration for native connections.
+///
+/// When `None`, a plain TCP connection is used (port 9000 default).
+/// When `Some`, the connection is wrapped in TLS (port 9440 default).
+#[cfg(feature = "native-tls-rustls")]
+pub(crate) type TlsConfig = Option<(
+    std::sync::Arc<rustls::ClientConfig>,
+    rustls::pki_types::ServerName<'static>,
+)>;
+
+#[cfg(not(feature = "native-tls-rustls"))]
+pub(crate) type TlsConfig = ();
 
 /// A single native TCP connection to ClickHouse.
 pub(crate) struct NativeConnection {
-    reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
-    writer: BufWriter<tokio::io::WriteHalf<TcpStream>>,
+    reader: BufReader<tokio::io::ReadHalf<MaybeTlsStream>>,
+    writer: BufWriter<tokio::io::WriteHalf<MaybeTlsStream>>,
     server_hello: ServerHello,
     compression: NativeCompressionMethod,
     settings: Vec<(String, String)>,
@@ -32,6 +44,9 @@ pub(crate) struct NativeConnection {
 
 impl NativeConnection {
     /// Connect and perform the handshake.
+    ///
+    /// When `tls_config` is `Some(...)` (requires `native-tls-rustls` feature),
+    /// the TCP socket is wrapped in TLS before the ClickHouse handshake.
     pub(crate) async fn open(
         addr: &SocketAddr,
         database: &str,
@@ -39,8 +54,9 @@ impl NativeConnection {
         password: &str,
         compression: NativeCompressionMethod,
         settings: Vec<(String, String)>,
+        tls: &TlsConfig,
     ) -> Result<Self> {
-        let stream = tcp::connect(addr).await?;
+        let stream = Self::connect_stream(addr, tls).await?;
         let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = BufReader::with_capacity(CONN_READ_BUFFER, read_half);
         let mut writer = BufWriter::with_capacity(CONN_WRITE_BUFFER, write_half);
@@ -71,6 +87,7 @@ impl NativeConnection {
 
     /// Returns `true` if this connection has been marked as broken and should
     /// not be returned to the idle pool.
+    #[allow(dead_code)] // Pool recycler accesses `conn.poisoned` directly; method kept for external callers
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -89,19 +106,19 @@ impl NativeConnection {
             return false;
         }
         // Leftover bytes in the read buffer mean a previous query didn't drain
-        // completely — the connection is in an unknown state.
+        // completely -- the connection is in an unknown state.
         if !self.reader.buffer().is_empty() {
             return false;
         }
         // Non-blocking poll: detect EOF or unexpected data without blocking.
-        // A Pending result means the socket is idle → connection is alive.
+        // A Pending result means the socket is idle -> connection is alive.
         let mut buf = [0u8; 1];
         let mut read_buf = ReadBuf::new(&mut buf);
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         match Pin::new(&mut self.reader).poll_read(&mut cx, &mut read_buf) {
-            Poll::Pending => true,   // idle — connection is healthy
-            Poll::Ready(_) => false, // EOF or unexpected data — discard
+            Poll::Pending => true,   // idle -- connection is healthy
+            Poll::Ready(_) => false, // EOF or unexpected data -- discard
         }
     }
 
@@ -121,27 +138,92 @@ impl NativeConnection {
         self.compression
     }
 
+    /// Dispatch TCP vs TLS connection based on config.
+    #[cfg(feature = "native-tls-rustls")]
+    async fn connect_stream(addr: &SocketAddr, tls: &TlsConfig) -> Result<MaybeTlsStream> {
+        match tls {
+            Some((config, server_name)) => {
+                tcp::connect_tls(addr, config.clone(), server_name.clone()).await
+            }
+            None => tcp::connect(addr).await,
+        }
+    }
+
+    #[cfg(not(feature = "native-tls-rustls"))]
+    async fn connect_stream(addr: &SocketAddr, _tls: &TlsConfig) -> Result<MaybeTlsStream> {
+        tcp::connect(addr).await
+    }
+
     /// Mutable access to the write half for sending packets.
-    pub(crate) fn writer_mut(&mut self) -> &mut BufWriter<tokio::io::WriteHalf<TcpStream>> {
+    pub(crate) fn writer_mut(&mut self) -> &mut BufWriter<tokio::io::WriteHalf<MaybeTlsStream>> {
         &mut self.writer
     }
 
     /// Mutable access to the read half for receiving packets.
-    pub(crate) fn reader_mut(&mut self) -> &mut BufReader<tokio::io::ReadHalf<TcpStream>> {
+    pub(crate) fn reader_mut(&mut self) -> &mut BufReader<tokio::io::ReadHalf<MaybeTlsStream>> {
         &mut self.reader
     }
 
+    /// Activate ClickHouse roles for this session.
+    ///
+    /// Sends `SET ROLE `role1`, `role2`, ...` as a plain query and waits
+    /// for `EndOfStream`. Called once per new connection by the pool manager,
+    /// immediately after the handshake, before the connection is handed to
+    /// any query or insert.
+    ///
+    /// Role names are backtick-escaped to prevent injection.
+    pub(crate) async fn set_roles(&mut self, roles: &[String]) -> Result<()> {
+        debug_assert!(!roles.is_empty(), "set_roles called with empty slice");
+        let mut sql = String::from("SET ROLE ");
+        for (i, role) in roles.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            crate::sql::escape::identifier(role, &mut sql)
+                .expect("fmt::Write on String is infallible");
+        }
+        self.execute_query(&sql).await
+    }
+
     /// Execute a query and read all response packets until EndOfStream.
+    #[allow(dead_code)] // Convenience wrapper over execute_query_with; kept for callers that don't need query_id/settings
     pub(crate) async fn execute_query(&mut self, query: &str) -> Result<()> {
+        self.execute_query_with("", query, &[]).await
+    }
+
+    /// Execute a query with an explicit query ID and per-query settings.
+    ///
+    /// `query_id` is sent verbatim in the query packet header; pass `""` to
+    /// let the server generate its own ID.
+    ///
+    /// `extra_settings` are appended after the connection-level settings.
+    /// Callers that want per-query settings to *override* client settings
+    /// should perform the merge themselves before calling this method.
+    pub(crate) async fn execute_query_with(
+        &mut self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+    ) -> Result<()> {
         let revision = self.server_hello.revision_version;
         let compression = self.compression;
 
-        writer::send_query(&mut self.writer, "", query, &self.settings, revision, compression).await?;
+        // Merge connection-level settings with per-query overrides.
+        let settings = merge_settings(&self.settings, extra_settings);
+
+        writer::send_query(
+            &mut self.writer,
+            query_id,
+            query,
+            &settings,
+            revision,
+            compression,
+        )
+        .await?;
         writer::send_empty_block(&mut self.writer, compression).await?;
 
         loop {
-            let packet =
-                reader::read_packet(&mut self.reader, revision, compression).await?;
+            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
             match packet {
                 ServerPacket::EndOfStream => break,
                 ServerPacket::Exception(err) => {
@@ -159,19 +241,23 @@ impl NativeConnection {
     /// Sends `INSERT INTO table(cols) FORMAT Native` + an empty data block,
     /// then reads server packets until the schema Data block (0 rows) arrives.
     /// Returns the column headers `(name, type_name)` declared by the server.
-    pub(crate) async fn begin_insert(
-        &mut self,
-        query: &str,
-    ) -> Result<Vec<(String, String)>> {
+    pub(crate) async fn begin_insert(&mut self, query: &str) -> Result<Vec<(String, String)>> {
         let revision = self.server_hello.revision_version;
         let compression = self.compression;
 
-        writer::send_query(&mut self.writer, "", query, &self.settings, revision, compression).await?;
+        writer::send_query(
+            &mut self.writer,
+            "",
+            query,
+            &self.settings,
+            revision,
+            compression,
+        )
+        .await?;
         writer::send_empty_block(&mut self.writer, compression).await?;
 
         loop {
-            let packet =
-                reader::read_packet(&mut self.reader, revision, compression).await?;
+            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
             match packet {
                 reader::ServerPacket::Data(block) => {
                     return Ok(block
@@ -216,8 +302,7 @@ impl NativeConnection {
         writer::send_empty_block(&mut self.writer, compression).await?;
 
         loop {
-            let packet =
-                reader::read_packet(&mut self.reader, revision, compression).await?;
+            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
             match packet {
                 reader::ServerPacket::EndOfStream => return Ok(()),
                 reader::ServerPacket::Exception(err) => {
@@ -235,8 +320,7 @@ impl NativeConnection {
 
         writer::send_ping(&mut self.writer).await?;
         loop {
-            let packet =
-                reader::read_packet(&mut self.reader, revision, compression).await?;
+            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
             match packet {
                 ServerPacket::Pong => return Ok(()),
                 ServerPacket::Exception(err) => {
@@ -248,17 +332,30 @@ impl NativeConnection {
     }
 }
 
+/// Merge `base` settings with `extra`, where `extra` overrides duplicates.
+///
+/// Returns a `Vec` containing all entries from `base` (with any keys that also
+/// appear in `extra` replaced by the `extra` value), followed by any `extra`
+/// keys that were not present in `base`.
+fn merge_settings(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String, String)> {
+    if extra.is_empty() {
+        return base.to_vec();
+    }
+    let mut merged = base.to_vec();
+    for (k, v) in extra {
+        if let Some(slot) = merged.iter_mut().find(|(ek, _)| ek == k) {
+            slot.1 = v.clone();
+        } else {
+            merged.push((k.clone(), v.clone()));
+        }
+    }
+    merged
+}
+
 /// A no-op [`Waker`] used for non-blocking `poll_read` calls in `check_alive`.
 ///
-/// The waker never schedules anything — it is used purely to drive a single
+/// The waker never schedules anything -- it is used purely to drive a single
 /// synchronous poll without registering for wake-up notifications.
 fn noop_waker() -> Waker {
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| RawWaker::new(p, &VTABLE), // clone
-        |_| {},                        // wake
-        |_| {},                        // wake_by_ref
-        |_| {},                        // drop
-    );
-    // SAFETY: the vtable is a no-op; the data pointer is never dereferenced.
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    Waker::noop().clone()
 }

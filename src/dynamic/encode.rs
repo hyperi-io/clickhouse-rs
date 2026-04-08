@@ -5,9 +5,34 @@
 //! and the efficient binary wire format that ClickHouse expects.
 //!
 //! **Performance:** avoids the JSON text overhead of JSONEachRow.
-//! ClickHouse receives pre-columnarised binary — zero server-side parsing.
+//! ClickHouse receives pre-columnarised binary -- zero server-side parsing.
 //!
-//! # Encoding Rules
+//! # Hot path optimisations (ported from dfe-loader)
+//!
+//! This encoder runs once per column per row. Three optimisations reduce
+//! overhead at scale:
+//!
+//! - **`Cow<str>` in `value_to_str()`:** the common case (Value::String)
+//!   borrows the existing string directly -- zero allocation. Only non-string
+//!   types (numbers, bools) allocate a temporary for conversion. At 100k
+//!   rows x 20 string columns, that is 2M allocations avoided per batch.
+//!
+//! - **`TypeTag` enum dispatch:** `encode_typed()` matches on a pre-computed
+//!   integer discriminant (`pt.tag`) instead of `pt.base.as_str()`. String
+//!   comparison is O(n) per character; enum match is a single jump table.
+//!   The tag is resolved once at schema-fetch time, reused on every row.
+//!
+//! - **`FxHashMap` for schema lookups:** column_index, schema caches, and
+//!   metadata caches use `rustc_hash::FxHashMap` (non-cryptographic, 2-3x
+//!   faster than std HashMap for string keys). These are internal maps with
+//!   application-controlled keys -- no need for DoS-resistant hashing.
+//!
+//! Note: `serde_json::Value` in the public API is deliberate. sonic-rs (SIMD
+//! JSON) accelerates text-to-Value parsing, which happens in the *caller*
+//! (e.g. dfe-loader). This encoder only reads already-parsed Values and
+//! writes binary -- the Value type itself is not the bottleneck.
+//!
+//! # Encoding rules
 //!
 //! - Columns are written in schema order
 //! - Missing columns with server-side defaults are skipped
@@ -16,6 +41,8 @@
 //! - Strings: varint length prefix + UTF-8 bytes
 //! - Integers: little-endian fixed-width
 //! - UUID: two little-endian u64 (high, low)
+
+use std::borrow::Cow;
 
 use serde_json::{Map, Value};
 
@@ -46,7 +73,7 @@ pub fn encode_dynamic_row(
 ///
 /// Includes columns that are present in the row OR that have no default
 /// (must send something). Columns with defaults that aren't in the row
-/// are omitted — ClickHouse fills them server-side.
+/// are omitted -- ClickHouse fills them server-side.
 pub fn columns_to_send<'a>(
     row: &Map<String, Value>,
     schema: &'a DynamicSchema,
@@ -73,7 +100,7 @@ fn encode_value(value: &Value, col: &ColumnDef, buf: &mut Vec<u8>) -> Result<(),
         }
         buf.push(0); // is_null = false
     } else if value.is_null() {
-        // Non-nullable column with null value — write type default
+        // Non-nullable column with null value -- write type default
         write_default(pt, buf);
         return Ok(());
     }
@@ -87,13 +114,16 @@ fn encode_typed(
     col_name: &str,
     buf: &mut Vec<u8>,
 ) -> Result<(), DynamicError> {
-    match pt.base.as_str() {
-        "String" => {
-            let s = value_to_string(value);
+    use super::parsed_type::TypeTag;
+
+    // Dispatch on pre-computed TypeTag -- integer comparison, not string.
+    match pt.tag {
+        TypeTag::String => {
+            let s = value_to_str(value);
             write_string(s.as_bytes(), buf);
         }
-        "FixedString" => {
-            let s = value_to_string(value);
+        TypeTag::FixedString => {
+            let s = value_to_str(value);
             let n = pt.fixed_size.unwrap_or(1);
             let bytes = s.as_bytes();
             if bytes.len() <= n {
@@ -103,70 +133,63 @@ fn encode_typed(
                 buf.extend_from_slice(&bytes[..n]);
             }
         }
-        "UInt8" | "Bool" => {
+        TypeTag::UInt8 | TypeTag::Bool => {
             buf.push(as_u64(value, col_name)? as u8);
         }
-        "UInt16" => {
+        TypeTag::UInt16 => {
             buf.extend_from_slice(&(as_u64(value, col_name)? as u16).to_le_bytes());
         }
-        "UInt32" | "DateTime" => {
+        TypeTag::UInt32 | TypeTag::DateTime => {
             buf.extend_from_slice(&(as_u64(value, col_name)? as u32).to_le_bytes());
         }
-        "UInt64" => {
+        TypeTag::UInt64 => {
             buf.extend_from_slice(&as_u64(value, col_name)?.to_le_bytes());
         }
-        "Int8" | "Enum8" => {
+        TypeTag::Int8 | TypeTag::Enum8 => {
             buf.extend_from_slice(&(as_i64(value, col_name)? as i8).to_le_bytes());
         }
-        "Int16" | "Enum16" | "Date" => {
+        TypeTag::Int16 | TypeTag::Enum16 | TypeTag::Date => {
             buf.extend_from_slice(&(as_i64(value, col_name)? as i16).to_le_bytes());
         }
-        "Int32" | "Date32" | "Decimal32" => {
+        TypeTag::Int32 | TypeTag::Date32 | TypeTag::Decimal32 => {
             buf.extend_from_slice(&(as_i64(value, col_name)? as i32).to_le_bytes());
         }
-        "Int64" | "DateTime64" | "Decimal64" => {
+        TypeTag::Int64 | TypeTag::DateTime64 | TypeTag::Decimal64 => {
             buf.extend_from_slice(&as_i64(value, col_name)?.to_le_bytes());
         }
-        "Float32" => {
+        TypeTag::Float32 => {
             buf.extend_from_slice(&(as_f64(value, col_name)? as f32).to_le_bytes());
         }
-        "Float64" => {
+        TypeTag::Float64 => {
             buf.extend_from_slice(&as_f64(value, col_name)?.to_le_bytes());
         }
-        "UUID" => encode_uuid(value, col_name, buf)?,
-        "IPv4" => encode_ipv4(value, col_name, buf)?,
-        "IPv6" => encode_ipv6(value, col_name, buf)?,
-        "Array" => {
+        TypeTag::UUID => encode_uuid(value, col_name, buf)?,
+        TypeTag::IPv4 => encode_ipv4(value, col_name, buf)?,
+        TypeTag::IPv6 => encode_ipv6(value, col_name, buf)?,
+        TypeTag::Array => {
             let elem = pt
                 .array_element
                 .as_ref()
                 .ok_or_else(|| enc_err(col_name, "Array without element type"))?;
             encode_array(value, elem, col_name, buf)?;
         }
-        "Map" => {
+        TypeTag::Map => {
             let (kt, vt) = pt
                 .map_types
                 .as_ref()
                 .ok_or_else(|| enc_err(col_name, "Map without key/value types"))?;
             encode_map(value, kt, vt, col_name, buf)?;
         }
-        "JSON" => {
-            // JSON type — send as length-prefixed JSON string
+        TypeTag::JSON => {
+            // JSON type -- send as length-prefixed JSON string
             let json_str = value.to_string();
             write_string(json_str.as_bytes(), buf);
         }
-        other => {
-            // Unknown type — try as string (forward-compatible)
-            let s = value_to_string(value);
+        // 128/256-bit types, Point, Tuple: encode as string (forward-compat).
+        // These are rarely used in dynamic insert paths.
+        _ => {
+            let s = value_to_str(value);
             write_string(s.as_bytes(), buf);
-            // Log but don't fail — ClickHouse may accept it
-            #[cfg(feature = "tracing")]
-            tracing::debug!(
-                column = col_name,
-                r#type = other,
-                "encoding unknown type as String"
-            );
-            let _ = other;
         }
     }
     Ok(())
@@ -206,13 +229,15 @@ fn write_default(pt: &super::parsed_type::ParsedType, buf: &mut Vec<u8>) {
 // Value coercion helpers
 // ---------------------------------------------------------------------------
 
-fn value_to_string(value: &Value) -> String {
+/// Borrow the string directly when possible (the common case), only
+/// allocate for non-string types that need conversion.
+fn value_to_str(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => String::new(),
-        other => other.to_string(),
+        Value::String(s) => Cow::Borrowed(s.as_str()),
+        Value::Number(n) => Cow::Owned(n.to_string()),
+        Value::Bool(b) => Cow::Borrowed(if *b { "true" } else { "false" }),
+        Value::Null => Cow::Borrowed(""),
+        other => Cow::Owned(other.to_string()),
     }
 }
 
@@ -261,7 +286,7 @@ fn as_f64(value: &Value, col: &str) -> Result<f64, DynamicError> {
 // ---------------------------------------------------------------------------
 
 fn encode_uuid(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
-    let s = value_to_string(value);
+    let s = value_to_str(value);
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
         return Err(enc_err(col, "invalid UUID length"));
@@ -275,7 +300,7 @@ fn encode_uuid(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
 }
 
 fn encode_ipv4(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
-    let s = value_to_string(value);
+    let s = value_to_str(value);
     let addr: std::net::Ipv4Addr = s.parse().map_err(|_| enc_err(col, "invalid IPv4"))?;
     // ClickHouse stores IPv4 as UInt32 little-endian
     buf.extend_from_slice(&u32::from(addr).to_le_bytes());
@@ -283,7 +308,7 @@ fn encode_ipv4(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
 }
 
 fn encode_ipv6(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
-    let s = value_to_string(value);
+    let s = value_to_str(value);
     let addr: std::net::Ipv6Addr = s.parse().map_err(|_| enc_err(col, "invalid IPv6"))?;
     buf.extend_from_slice(&addr.octets());
     Ok(())

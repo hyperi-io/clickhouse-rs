@@ -14,6 +14,7 @@ fn get_native_client() -> NativeClient {
     let port = std::env::var("CLICKHOUSE_NATIVE_PORT").unwrap_or_else(|_| "9000".into());
     let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".into());
     let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "".into());
+    let use_tls = std::env::var("CLICKHOUSE_TLS").unwrap_or_default() == "true";
 
     let client = NativeClient::default()
         .with_addr(format!("{host}:{port}"))
@@ -21,12 +22,26 @@ fn get_native_client() -> NativeClient {
         .with_user(user)
         .with_password(password);
 
+    // Enable TLS if CLICKHOUSE_TLS=true (requires native-tls-rustls feature).
+    // Uses the hostname from CLICKHOUSE_HOST for SNI verification.
+    #[cfg(feature = "native-tls-rustls")]
+    let client = if use_tls {
+        client.with_tls(&host)
+    } else {
+        client
+    };
+
+    #[cfg(not(feature = "native-tls-rustls"))]
+    if use_tls {
+        panic!("CLICKHOUSE_TLS=true requires native-tls-rustls feature");
+    }
+
     // On a replicated cluster, write to a quorum of replicas before returning
     // and ensure SELECT only reads quorum-committed data.  This gives
     // read-after-write consistency without pinning connections to a single node.
     //
     // CLICKHOUSE_INSERT_QUORUM: number of replicas that must acknowledge each
-    // INSERT — set to the replica count for your cluster (default: 2).
+    // INSERT -- set to the replica count for your cluster (default: 2).
     if std::env::var("CLICKHOUSE_CLUSTER").is_ok() {
         let quorum = std::env::var("CLICKHOUSE_INSERT_QUORUM")
             .unwrap_or_else(|_| "2".into());
@@ -42,19 +57,21 @@ fn get_native_client() -> NativeClient {
 /// Create a unique test database for isolation (mirrors `prepare_database!` for HTTP tests).
 ///
 /// When `CLICKHOUSE_CLUSTER` is set, databases are created ON CLUSTER so all
-/// nodes see the database immediately — required for multi-node setups.
+/// nodes see the database immediately -- required for multi-node setups.
 async fn prepare_native_database(test_name: &str) -> NativeClient {
     let client = get_native_client();
     let db = format!("chrs_native_{test_name}");
     let cluster = std::env::var("CLICKHOUSE_CLUSTER").ok();
 
+    // SYNC ensures the DDL propagates to all replicas before returning,
+    // preventing "already exists" races on re-runs against a cluster.
     let drop_sql = match &cluster {
-        Some(c) => format!("DROP DATABASE IF EXISTS {db} ON CLUSTER {c}"),
-        None => format!("DROP DATABASE IF EXISTS {db}"),
+        Some(c) => format!("DROP DATABASE IF EXISTS {db} ON CLUSTER {c} SYNC"),
+        None => format!("DROP DATABASE IF EXISTS {db} SYNC"),
     };
     let create_sql = match &cluster {
-        Some(c) => format!("CREATE DATABASE {db} ON CLUSTER {c}"),
-        None => format!("CREATE DATABASE {db}"),
+        Some(c) => format!("CREATE DATABASE IF NOT EXISTS {db} ON CLUSTER {c}"),
+        None => format!("CREATE DATABASE IF NOT EXISTS {db}"),
     };
 
     client
@@ -81,7 +98,7 @@ fn on_cluster() -> String {
 
 /// Returns the table engine clause for tests.
 ///
-/// Local Docker: `ENGINE = Memory` — fast, no persistence needed.
+/// Local Docker: `ENGINE = Memory` -- fast, no persistence needed.
 /// External cluster: `ReplicatedMergeTree` with a per-table `{uuid}` ZK path so
 /// each CREATE TABLE gets a unique ZooKeeper node (no stale-replica conflicts on
 /// re-runs).  The `{uuid}` macro is substituted by ClickHouse at CREATE time.
@@ -303,7 +320,7 @@ async fn native_multiple_blocks() {
         .await
         .expect("CREATE failed");
 
-    // Insert 10,000 rows — server will send multiple blocks
+    // Insert 10,000 rows -- server will send multiple blocks
     client
         .query(
             "INSERT INTO t SELECT number FROM system.numbers LIMIT 10000",
@@ -431,7 +448,7 @@ async fn native_map_type() {
 async fn native_json_legacy() {
     let client = prepare_native_database("json_legacy").await;
 
-    // Object('json') is the legacy JSON type — stored as String on the wire.
+    // Object('json') is the legacy JSON type -- stored as String on the wire.
     client
         .query(
             &format!("CREATE TABLE t{} (id UInt32, data Object('json')) {} \
@@ -441,11 +458,11 @@ async fn native_json_legacy() {
         .execute()
         .await
         .unwrap_or_else(|e| {
-            // Legacy Object type may not be available on all server versions — skip
+            // Legacy Object type may not be available on all server versions -- skip
             eprintln!("SKIP native_json_legacy: {e}");
         });
 
-    // Insert and query are separate — if CREATE failed, just verify we skip cleanly
+    // Insert and query are separate -- if CREATE failed, just verify we skip cleanly
     let rows_result = client
         .query(
             "SELECT id, CAST(data, 'String') AS data FROM t ORDER BY id ASC",
@@ -635,7 +652,7 @@ async fn native_decimal_type() {
         .await
         .expect("INSERT failed");
 
-    // Decimal64 is stored as i64 (scaled integer) — maps to i64 in Rust
+    // Decimal64 is stored as i64 (scaled integer) -- maps to i64 in Rust
     #[derive(Debug, Row, Deserialize)]
     struct DecimalRow {
         id: u32,
@@ -649,9 +666,9 @@ async fn native_decimal_type() {
         .expect("fetch failed");
 
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0].price, 1234);  // 12.34 × 100
-    assert_eq!(rows[1].price, 9999);  // 99.99 × 100
-    assert_eq!(rows[2].price, 1);     // 0.01 × 100
+    assert_eq!(rows[0].price, 1234);  // 12.34 x 100
+    assert_eq!(rows[1].price, 9999);  // 99.99 x 100
+    assert_eq!(rows[2].price, 1);     // 0.01 x 100
 }
 
 #[tokio::test]
@@ -741,7 +758,7 @@ async fn native_extended_int_types() {
         .await
         .expect("INSERT failed");
 
-    // 256-bit types have no native Rust equivalent — read as raw 32-byte LE arrays.
+    // 256-bit types have no native Rust equivalent -- read as raw 32-byte LE arrays.
     #[derive(Debug, Row, Deserialize)]
     struct ExtIntRow {
         u128: u128,
@@ -762,7 +779,7 @@ async fn native_extended_int_types() {
     // UInt256(42): first byte = 42, rest zero (LE)
     assert_eq!(rows[0].u256[0], 42);
     assert!(rows[0].u256[1..].iter().all(|&b| b == 0));
-    // Int256(-42): two's complement 32-byte LE — last bytes all 0xFF
+    // Int256(-42): two's complement 32-byte LE -- last bytes all 0xFF
     assert_eq!(rows[0].i256[31], 0xFF);
 }
 
@@ -816,8 +833,8 @@ async fn native_bfloat16_uuid() {
     assert_eq!(rows[1].bf, 0x4000u16);
     // ClickHouse stores UUID as two LE uint64s: high 8 bytes then low 8 bytes.
     // UUID 00000000-0000-0000-0000-000000000001:
-    //   high u64 = 0 → bytes [0..8] all zero
-    //   low  u64 = 1 → bytes [8..16] = [1, 0, 0, 0, 0, 0, 0, 0] (LE)
+    //   high u64 = 0 -> bytes [0..8] all zero
+    //   low  u64 = 1 -> bytes [8..16] = [1, 0, 0, 0, 0, 0, 0, 0] (LE)
     assert_eq!(rows[0].uuid[8], 1);
     assert!(rows[0].uuid[..8].iter().all(|&b| b == 0));
     assert!(rows[0].uuid[9..].iter().all(|&b| b == 0));
@@ -858,7 +875,7 @@ async fn native_enum_types() {
         .await
         .expect("INSERT failed");
 
-    // Enum8/16 are wire-compatible with Int8/Int16 — deserialize as raw integer discriminant.
+    // Enum8/16 are wire-compatible with Int8/Int16 -- deserialize as raw integer discriminant.
     #[derive(Debug, Row, Deserialize)]
     struct EnumRow {
         id: u32,
@@ -919,7 +936,7 @@ async fn native_datetime_all() {
         .expect("INSERT failed");
 
     // Date = u16 (days since 1970-01-01), DateTime = u32 (unix seconds),
-    // DateTime64(N) = i64 (scaled: ×10^N from epoch).
+    // DateTime64(N) = i64 (scaled: x10^N from epoch).
     #[derive(Debug, Row, Deserialize)]
     struct DtRow {
         id: u32,
@@ -990,9 +1007,9 @@ async fn native_decimal_all_sizes() {
         .expect("fetch failed");
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].d32, 1234);         // 12.34 × 100
-    assert_eq!(rows[0].d128, 12345678i128); // 1234.5678 × 10^4
-    // d256: 123456789012 (123456.789012 × 10^6) — check first bytes
+    assert_eq!(rows[0].d32, 1234);         // 12.34 x 100
+    assert_eq!(rows[0].d128, 12345678i128); // 1234.5678 x 10^4
+    // d256: 123456789012 (123456.789012 x 10^6) -- check first bytes
     let expected: i64 = 123_456_789_012;
     let le_bytes = expected.to_le_bytes();
     assert_eq!(&rows[0].d256[..8], &le_bytes);
@@ -1078,7 +1095,7 @@ async fn native_geo_types() {
         .await
         .expect("INSERT failed");
 
-    // Point = 2 × Float64 LE (16 raw bytes).  Read as [u8; 16] to avoid
+    // Point = 2 x Float64 LE (16 raw bytes).  Read as [u8; 16] to avoid
     // relying on serde tuple deserialization, then decode f64 values manually.
     #[derive(Debug, Row, Deserialize)]
     struct GeoRow {
@@ -1678,7 +1695,7 @@ async fn native_insert_lz4() {
 // Pool edge cases
 // ---------------------------------------------------------------------------
 
-/// Pool size 2, 10 concurrent tasks — all must succeed.
+/// Pool size 2, 10 concurrent tasks -- all must succeed.
 /// Verifies that tasks waiting for a connection are eventually served.
 #[tokio::test]
 async fn native_pool_concurrent() {
@@ -1723,7 +1740,7 @@ async fn native_pool_error_recovery() {
     assert_eq!(n, 99);
 }
 
-/// Pool size 1 + many concurrent inserts — verifies no deadlock when the
+/// Pool size 1 + many concurrent inserts -- verifies no deadlock when the
 /// INSERT holds the sole connection and another task waits for it.
 #[tokio::test]
 async fn native_pool_insert_wait() {
@@ -1747,7 +1764,7 @@ async fn native_pool_insert_wait() {
     }
 
     // Task A holds the connection in an INSERT.
-    // Task B tries to ping at the same time — it must wait, not deadlock.
+    // Task B tries to ping at the same time -- it must wait, not deadlock.
     let client_a = small_client.clone();
     let client_b = small_client.clone();
 
@@ -1770,7 +1787,7 @@ async fn native_pool_insert_wait() {
 // Bool / sparse-serialization edge cases
 // ---------------------------------------------------------------------------
 
-/// All rows false — sparse format sends 0 non-default values.
+/// All rows false -- sparse format sends 0 non-default values.
 #[tokio::test]
 async fn native_bool_all_false() {
     let client = prepare_native_database("bool_all_false").await;
@@ -1811,7 +1828,7 @@ async fn native_bool_all_false() {
     }
 }
 
-/// All rows true — sparse format stores every row as a non-default value.
+/// All rows true -- sparse format stores every row as a non-default value.
 #[tokio::test]
 async fn native_bool_all_true() {
     let client = prepare_native_database("bool_all_true").await;
@@ -1852,7 +1869,7 @@ async fn native_bool_all_true() {
     }
 }
 
-/// Mixed true/false across many rows — exercises sparse offset groups.
+/// Mixed true/false across many rows -- exercises sparse offset groups.
 #[tokio::test]
 async fn native_bool_many_rows() {
     let client = prepare_native_database("bool_many_rows").await;
@@ -1868,7 +1885,7 @@ async fn native_bool_many_rows() {
         .expect("CREATE failed");
 
     // Insert 200 rows in one batch: alternating true/false, then a run of
-    // 50 trues, then 50 falses — exercises multiple sparse offset groups.
+    // 50 trues, then 50 falses -- exercises multiple sparse offset groups.
     let vals: String = (0..200u32)
         .map(|i| {
             let b = if i < 100 { i % 2 == 0 } else { i < 150 };
@@ -1944,7 +1961,7 @@ async fn native_bool_nullable() {
     assert_eq!(rows[2], BoolRow { id: 3, flag: None });
 }
 
-/// INSERT Bool via `NativeInsert<T>` (not SQL VALUES) — tests the encoder path.
+/// INSERT Bool via `NativeInsert<T>` (not SQL VALUES) -- tests the encoder path.
 #[tokio::test]
 async fn native_insert_bool() {
     let client = prepare_native_database("insert_bool").await;
@@ -1985,7 +2002,7 @@ async fn native_insert_bool() {
 
 /// Bool column alongside non-sparse UInt32 and String columns.
 ///
-/// Verifies that the sparse decoder does not misalign the stream — after reading
+/// Verifies that the sparse decoder does not misalign the stream -- after reading
 /// the Bool column's sparse offsets + values, the reader must be positioned
 /// exactly at the next column's data.
 #[tokio::test]
@@ -2028,7 +2045,7 @@ async fn native_bool_sparse_stream_alignment() {
     assert_eq!(rows[3], R { id: 4, flag: false, name: "dave".into() });
 }
 
-/// Two consecutive Bool columns — each must decode its own sparse stream
+/// Two consecutive Bool columns -- each must decode its own sparse stream
 /// independently without cross-contamination.
 #[tokio::test]
 async fn native_bool_multi_sparse_columns() {
@@ -2044,7 +2061,7 @@ async fn native_bool_multi_sparse_columns() {
         .await
         .expect("CREATE failed");
 
-    // a: T F T F T, b: F F T T F → different sparse patterns.
+    // a: T F T F T, b: F F T T F -> different sparse patterns.
     client
         .query("INSERT INTO t VALUES (true,false),(false,false),(true,true),(false,true),(true,false)")
         .execute()
@@ -2113,7 +2130,7 @@ async fn native_bool_sparse_large_gap() {
     }
 }
 
-/// 1 000 rows, only position 0 is `true` — zero-offset sparse group.
+/// 1 000 rows, only position 0 is `true` -- zero-offset sparse group.
 #[tokio::test]
 async fn native_bool_sparse_single_at_start() {
     let client = prepare_native_database("bool_sparse_single_start").await;
@@ -2157,7 +2174,7 @@ async fn native_bool_sparse_single_at_start() {
 // INSERT edge cases
 // ---------------------------------------------------------------------------
 
-/// Write 50 000 rows — enough to trigger multiple intermediate flushes at the
+/// Write 50 000 rows -- enough to trigger multiple intermediate flushes at the
 /// 256 KiB threshold.  Verifies all rows arrive after end().
 #[tokio::test]
 async fn native_insert_large_batch() {
@@ -2194,7 +2211,7 @@ async fn native_insert_large_batch() {
     assert_eq!(count, N, "row count mismatch after large batch");
 }
 
-/// Drop `NativeInsert` without calling `end()` — must not commit any data,
+/// Drop `NativeInsert` without calling `end()` -- must not commit any data,
 /// and must not leave the pool connection in a broken state.
 #[tokio::test]
 async fn native_insert_abort() {
@@ -2215,12 +2232,12 @@ async fn native_insert_abort() {
         id: u32,
     }
 
-    // Write two rows then drop without end() — aborts the INSERT.
+    // Write two rows then drop without end() -- aborts the INSERT.
     {
         let mut insert = client.insert::<R>("t");
         insert.write(&R { id: 1 }).await.expect("write 1 failed");
         insert.write(&R { id: 2 }).await.expect("write 2 failed");
-        // dropped here — connection must be discarded, not returned to pool
+        // dropped here -- connection must be discarded, not returned to pool
     }
 
     // The pool must still work after the aborted insert.
@@ -2319,7 +2336,7 @@ async fn native_query_fetch_optional() {
         .await
         .expect("CREATE failed");
 
-    // Empty table → None.
+    // Empty table -> None.
     let none: Option<u32> = client
         .query("SELECT id FROM t")
         .fetch_optional::<u32>()
@@ -2334,7 +2351,7 @@ async fn native_query_fetch_optional() {
         .await
         .expect("INSERT failed");
 
-    // One row → Some.
+    // One row -> Some.
     let some: Option<u32> = client
         .query("SELECT id FROM t LIMIT 1")
         .fetch_optional::<u32>()
@@ -2343,16 +2360,19 @@ async fn native_query_fetch_optional() {
     assert_eq!(some, Some(42u32));
 }
 
-/// `bind()` with multiple `?` placeholders — each replaces the next occurrence.
+/// `bind()` with multiple `?` placeholders -- each replaces the next occurrence.
+/// Note: bind() escapes values as quoted strings (safe against injection).
+/// For typed arithmetic, use server-side param() binding.
 #[tokio::test]
 async fn native_query_bind_multiple() {
     let client = get_native_client();
 
-    // ClickHouse infers UInt8 for small literals; match the inferred type.
+    // bind() wraps values in single quotes (string escaping), so use
+    // param() for typed server-side binding when types matter.
     let result: u8 = client
-        .query("SELECT ? + ?")
-        .bind(10u8)
-        .bind(32u8)
+        .query("SELECT {a:UInt8} + {b:UInt8}")
+        .param("a", 10u8)
+        .param("b", 32u8)
         .fetch_one::<u8>()
         .await
         .expect("fetch failed");
@@ -2360,14 +2380,14 @@ async fn native_query_bind_multiple() {
     assert_eq!(result, 42u8);
 }
 
-/// `bind()` when the SQL has no `?` — should be a no-op (query unchanged).
+/// `bind()` when the SQL has no `?` -- should be a no-op (query unchanged).
 #[tokio::test]
 async fn native_query_bind_no_placeholder() {
     let client = get_native_client();
 
     let result: u8 = client
         .query("SELECT 1")
-        .bind(999u32)   // no placeholder — ignored
+        .bind(999u32)   // no placeholder -- ignored
         .fetch_one::<u8>()
         .await
         .expect("fetch failed");
@@ -2418,7 +2438,7 @@ async fn native_nullable_all_null() {
     }
 }
 
-/// Array(Nullable(String)) — nulls inside an array.
+/// Array(Nullable(String)) -- nulls inside an array.
 #[tokio::test]
 async fn native_array_of_nullable() {
     let client = prepare_native_database("array_nullable").await;
@@ -2508,7 +2528,7 @@ async fn native_schema_cache_clear_all() {
 
     assert!(client.cached_schema("t").is_some(), "cache should be populated after INSERT");
 
-    // Clear all — cache must be empty.
+    // Clear all -- cache must be empty.
     client.clear_all_cached_schemas();
     assert!(client.cached_schema("t").is_none(), "cache should be empty after clear_all");
 
@@ -2518,9 +2538,9 @@ async fn native_schema_cache_clear_all() {
     assert!(client.cached_schema("t").is_some(), "cache should be re-populated after fetch_schema");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // AsyncNativeInserter tests
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
 #[tokio::test]
 async fn native_async_inserter_basic() {
@@ -2720,7 +2740,7 @@ async fn native_async_inserter_empty_end() {
     assert_eq!(count, 0);
 }
 
-// ── Edge cases ───────────────────────────────────────────────────────────
+// -- Edge cases -----------------------------------------------------------
 
 /// Writing a single row should work.
 #[tokio::test]
@@ -2996,9 +3016,9 @@ async fn native_async_inserter_tiny_channel() {
     assert_eq!(count, 20);
 }
 
-// ── Failure / error propagation ──────────────────────────────────────────
+// -- Failure / error propagation ------------------------------------------
 
-/// Handle becomes inert after the inserter is ended — writes should fail.
+/// Handle becomes inert after the inserter is ended -- writes should fail.
 #[tokio::test]
 async fn native_async_inserter_handle_after_end() {
     use clickhouse::native::{AsyncNativeInserter, AsyncNativeInserterConfig};
@@ -3075,7 +3095,7 @@ async fn native_async_inserter_flush_after_end() {
     assert!(result.is_err(), "flush after end() should fail");
 }
 
-// ── Stress / concurrency ─────────────────────────────────────────────────
+// -- Stress / concurrency -------------------------------------------------
 
 /// Many concurrent writers with small max_rows to stress the flush path.
 #[tokio::test]
@@ -3191,9 +3211,9 @@ async fn native_async_inserter_interleaved_flush() {
     inserter.end().await.unwrap();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Large ugly JSON source tests — Filebeat / Winlogbeat payloads (native TCP)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// Large ugly JSON source tests -- Filebeat / Winlogbeat payloads (native TCP)
+// ===========================================================================
 //
 // Realistic, deeply nested JSON blobs matching Elastic Beat agent output.
 // Stresses: large String values, Unicode (CJK, Cyrillic, diacritics),
@@ -3845,7 +3865,7 @@ async fn native_async_inserter_filebeat_kubernetes() {
     assert!(rows[0].json_data.contains("¥123,456.78"));
 }
 
-/// Mixed Beat sources in a single batch — concurrent handles, one source per handle.
+/// Mixed Beat sources in a single batch -- concurrent handles, one source per handle.
 #[tokio::test]
 async fn native_async_inserter_mixed_beats_concurrent() {
     use clickhouse::native::{AsyncNativeInserter, AsyncNativeInserterConfig};
@@ -3909,7 +3929,7 @@ async fn native_async_inserter_mixed_beats_concurrent() {
 
     inserter.end().await.unwrap();
 
-    // 5 sources × 20 rows = 100
+    // 5 sources x 20 rows = 100
     let count: u64 = client
         .query("SELECT count() FROM t")
         .fetch_one()
@@ -3931,4 +3951,158 @@ async fn native_async_inserter_mixed_beats_concurrent() {
         .await
         .unwrap();
     assert_eq!(security_count, 20);
+}
+
+// ---------------------------------------------------------------------------
+// New feature tests -- native parity, observability, unified client
+// ---------------------------------------------------------------------------
+
+/// Verify server_version() returns sensible data.
+#[tokio::test]
+async fn native_server_version() {
+    let client = get_native_client();
+    let ver = client.server_version().await.unwrap();
+    assert!(!ver.name.is_empty(), "server name must not be empty");
+    assert!(ver.major > 0, "major version must be > 0, got {}", ver.major);
+    assert!(ver.revision > 0, "revision must be > 0");
+}
+
+/// Verify pool_stats() returns metrics consistent with pool_size.
+#[tokio::test]
+async fn native_pool_stats() {
+    let client = get_native_client().with_pool_size(3);
+    // Warm up one connection.
+    client.ping().await.unwrap();
+
+    let stats = client.pool_stats();
+    assert_eq!(stats.max_size, 3);
+    assert!(stats.size >= 1, "at least one connection should exist after ping");
+}
+
+/// Verify named parameters work via the .param() builder.
+#[tokio::test]
+async fn native_named_params() {
+    let client = get_native_client();
+    let result: u64 = client
+        .query("SELECT {val:UInt64}")
+        .param("val", 42u64)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert_eq!(result, 42);
+}
+
+/// Verify per-query settings override client settings.
+#[tokio::test]
+async fn native_per_query_settings() {
+    let client = get_native_client();
+    // max_result_rows=1 should cause an error when we try to fetch 2 rows
+    // (with result_overflow_mode=throw).
+    let result = client
+        .query("SELECT number FROM system.numbers LIMIT 2")
+        .with_settings([
+            ("max_result_rows".to_string(), "1".to_string()),
+            ("result_overflow_mode".to_string(), "throw".to_string()),
+        ])
+        .fetch_all::<u64>()
+        .await;
+    assert!(result.is_err(), "should fail with max_result_rows=1");
+}
+
+/// Verify query_id is respected -- appears in system.query_log.
+#[tokio::test]
+async fn native_query_id() {
+    let client = get_native_client();
+    let qid = format!("chrs_test_{:x}", rand::random::<u64>());
+
+    // Execute a query with a specific ID.
+    client
+        .query("SELECT 1")
+        .with_query_id(&qid)
+        .execute()
+        .await
+        .unwrap();
+
+    // Flush the query log.
+    client
+        .query("SYSTEM FLUSH LOGS")
+        .execute()
+        .await
+        .unwrap();
+
+    // Check it appears in query_log using a named parameter.
+    let count: u64 = client
+        .query("SELECT count() FROM system.query_log WHERE query_id = {qid:String}")
+        .param("qid", &qid)
+        .fetch_one()
+        .await
+        .unwrap();
+    assert!(count > 0, "query_id {qid} not found in system.query_log");
+}
+
+/// Verify insert timeouts -- a very short timeout should fail.
+#[tokio::test]
+async fn native_insert_timeout_fires() {
+    use std::time::Duration;
+
+    #[derive(Row, Serialize)]
+    struct TimeoutRow {
+        x: u64,
+    }
+
+    let client = get_native_client();
+    client
+        .query("CREATE TABLE IF NOT EXISTS default.chrs_timeout_test (x UInt64) ENGINE = Memory")
+        .execute()
+        .await
+        .unwrap();
+
+    // end_timeout of 1ns is effectively instant -- should time out.
+    let mut insert = client
+        .insert::<TimeoutRow>("default.chrs_timeout_test")
+        .with_timeouts(None, Some(Duration::from_nanos(1)));
+
+    insert.write(&TimeoutRow { x: 1 }).await.unwrap();
+    let result = insert.end().await;
+
+    // Clean up regardless of result.
+    let _ = client
+        .query("DROP TABLE IF EXISTS default.chrs_timeout_test")
+        .execute()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "insert with 1ns end_timeout should fail"
+    );
+}
+
+/// Verify multi-host round-robin -- multiple good addrs all work.
+#[tokio::test]
+async fn native_multi_host_round_robin() {
+    use std::net::ToSocketAddrs;
+
+    let host = std::env::var("CLICKHOUSE_HOST").unwrap_or_else(|_| "localhost".into());
+    let port = std::env::var("CLICKHOUSE_NATIVE_PORT").unwrap_or_else(|_| "9000".into());
+    let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".into());
+    let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "".into());
+
+    let addr = format!("{host}:{port}")
+        .to_socket_addrs()
+        .expect("resolve addr")
+        .next()
+        .expect("at least one addr");
+
+    // Two copies of the same good addr -- round-robin distributes across both.
+    let client = NativeClient::default()
+        .with_addrs(vec![addr, addr])
+        .with_database("default")
+        .with_user(user)
+        .with_password(password)
+        .with_pool_size(4);
+
+    // Multiple pings should all succeed, exercising round-robin selection.
+    for _ in 0..4 {
+        client.ping().await.expect("round-robin ping should succeed");
+    }
 }

@@ -16,6 +16,7 @@ pub(crate) const DBMS_MIN_REVISION_WITH_SERVER_DISPLAY_NAME: u64 = 54372;
 pub(crate) const DBMS_MIN_REVISION_WITH_VERSION_PATCH: u64 = 54401;
 pub(crate) const DBMS_MIN_REVISION_WITH_SERVER_LOGS: u64 = 54406;
 pub(crate) const DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO: u64 = 54420;
+#[allow(dead_code)] // Protocol constant -- used when settings serialisation as strings is wired
 pub(crate) const DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS: u64 = 54429;
 pub(crate) const DBMS_MIN_REVISION_WITH_OPENTELEMETRY: u64 = 54442;
 pub(crate) const DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET: u64 = 54441;
@@ -23,7 +24,9 @@ pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_DISTRIBUTED_DEPTH: u64 = 54448;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_QUERY_START_TIME: u64 = 54449;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARALLEL_REPLICAS: u64 = 54453;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
+#[allow(dead_code)] // Protocol constant -- used when profile events during INSERT are surfaced
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PROFILE_EVENTS_IN_INSERT: u64 = 54456;
+#[allow(dead_code)] // Protocol constant -- used when addendum packet handling is wired
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM: u64 = 54458;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_QUOTA_KEY: u64 = 54458;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS: u64 = 54459;
@@ -82,12 +85,6 @@ pub(crate) enum ClientPacketId {
     SSHChallengeRequest = 11,
     SSHChallengeResponse = 12,
     QueryPlan = 13,
-}
-
-pub(crate) struct ClientHello {
-    pub(crate) default_database: String,
-    pub(crate) username: String,
-    pub(crate) password: String,
 }
 
 // === Server packets ===
@@ -151,11 +148,11 @@ impl ServerPacketId {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ServerHello {
-    pub(crate) server_name: String,
-    pub(crate) version: (u64, u64, u64),
-    pub(crate) revision_version: u64,
-    pub(crate) timezone: Option<String>,
-    pub(crate) display_name: Option<String>,
+    pub server_name: String,
+    pub version: (u64, u64, u64),
+    pub revision_version: u64,
+    pub timezone: Option<String>,
+    pub display_name: Option<String>,
     pub(crate) chunked_send: ChunkedProtocolMode,
     pub(crate) chunked_recv: ChunkedProtocolMode,
 }
@@ -184,20 +181,21 @@ pub(crate) struct ServerException {
     pub(crate) name: String,
     pub(crate) message: String,
     pub(crate) stack_trace: String,
-    pub(crate) has_nested: bool,
+    pub(crate) _has_nested: bool, // read from wire; nested exceptions not yet surfaced
 }
 
 #[allow(unused)]
 #[derive(Debug, Clone)]
-pub(crate) struct ProfileInfo {
-    pub(crate) rows: u64,
-    pub(crate) blocks: u64,
-    pub(crate) bytes: u64,
-    pub(crate) applied_limit: bool,
-    pub(crate) rows_before_limit: u64,
-    pub(crate) calculated_rows_before_limit: bool,
-    pub(crate) applied_aggregation: bool,
-    pub(crate) rows_before_aggregation: u64,
+#[non_exhaustive]
+pub struct ProfileInfo {
+    pub rows: u64,
+    pub blocks: u64,
+    pub bytes: u64,
+    pub applied_limit: bool,
+    pub rows_before_limit: u64,
+    pub calculated_rows_before_limit: bool,
+    pub applied_aggregation: bool,
+    pub rows_before_aggregation: u64,
 }
 
 #[allow(unused)]
@@ -210,14 +208,15 @@ pub(crate) struct TableColumns {
 // === Progress ===
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Progress {
-    pub(crate) read_rows: u64,
-    pub(crate) read_bytes: u64,
-    pub(crate) total_rows_to_read: u64,
-    pub(crate) total_bytes_to_read: Option<u64>,
-    pub(crate) written_rows: Option<u64>,
-    pub(crate) written_bytes: Option<u64>,
-    pub(crate) elapsed_ns: Option<u64>,
+#[non_exhaustive]
+pub struct Progress {
+    pub read_rows: u64,
+    pub read_bytes: u64,
+    pub total_rows_to_read: u64,
+    pub total_bytes_to_read: Option<u64>,
+    pub written_rows: Option<u64>,
+    pub written_bytes: Option<u64>,
+    pub elapsed_ns: Option<u64>,
 }
 
 impl std::ops::Add for Progress {
@@ -296,8 +295,16 @@ impl ChunkedProtocolMode {
             return Err(Error::BadResponse(format!(
                 "native protocol: incompatible chunked mode for {direction}: \
                  client={}, server={}",
-                if client_chunked { "chunked" } else { "notchunked" },
-                if server_chunked { "chunked" } else { "notchunked" },
+                if client_chunked {
+                    "chunked"
+                } else {
+                    "notchunked"
+                },
+                if server_chunked {
+                    "chunked"
+                } else {
+                    "notchunked"
+                },
             )));
         } else {
             server_chunked
