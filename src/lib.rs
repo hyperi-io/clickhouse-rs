@@ -25,6 +25,7 @@ pub mod insert_formatted;
 pub mod inserter;
 pub mod query;
 pub mod serde;
+pub mod sink;
 pub mod sql;
 #[cfg(feature = "test-util")]
 pub mod test;
