@@ -14,6 +14,7 @@ pub(crate) mod client_info;
 pub(crate) mod columns;
 pub(crate) mod compression;
 pub(crate) mod connection;
+pub(crate) mod connection_actor;
 pub(crate) mod cursor;
 pub(crate) mod encode;
 pub(crate) mod error_codes;

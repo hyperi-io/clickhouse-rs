@@ -230,10 +230,22 @@ pub struct WorkerControl<C> {
 /// Multiple producers can hold one to push commands concurrently. The
 /// handle does NOT hold the worker alive on its own — the
 /// [`WorkerControl`] returned by [`spawn`] does.
-#[derive(Clone)]
 pub struct WorkerHandle<C> {
     tx: mpsc::Sender<(C, Span)>,
     name: &'static str,
+}
+
+// Manual `Clone` impl: the auto-derive over-bounds with `C: Clone`,
+// but `mpsc::Sender<T>` is `Clone` for any `T` — we don't need command
+// types to be `Clone`. Required so handles for non-Clone Command enums
+// (e.g. those carrying `oneshot::Sender`) can still be cloned.
+impl<C> Clone for WorkerHandle<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            name: self.name,
+        }
+    }
 }
 
 impl<C> std::fmt::Debug for WorkerControl<C> {
