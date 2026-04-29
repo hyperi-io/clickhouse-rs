@@ -51,6 +51,7 @@
 //! Tracer-bullet phase: only `Ping` is implemented. ExecuteQuery, INSERT,
 //! and streaming cursor follow in subsequent commits on the same branch.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -61,9 +62,12 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::error::{Error, Result};
-use crate::native::protocol::{NativeCompressionMethod, ServerHello};
+use crate::native::connection::TlsConfig;
+use crate::native::protocol::{
+    ChunkedProtocolMode, DBMS_TCP_PROTOCOL_VERSION, NativeCompressionMethod, ServerHello,
+};
 use crate::native::reader::{self, ServerPacket};
-use crate::native::tcp::{CONN_READ_BUFFER, CONN_WRITE_BUFFER, MaybeTlsStream};
+use crate::native::tcp::{self, CONN_READ_BUFFER, CONN_WRITE_BUFFER, MaybeTlsStream};
 use crate::native::writer;
 use crate::worker::{self, CommandWorker, WorkerControl, WorkerHandle};
 
@@ -640,15 +644,58 @@ impl CommandWorker for ConnectionActor {
 }
 
 impl ConnectionActor {
-    /// Create the actor, spawn the reader sub-task, and hand the actor
-    /// to [`worker::spawn`].
+    /// Connect, perform the ClickHouse hello/addendum handshake, and
+    /// spawn the actor with the resulting state. Returns an
+    /// [`OwnedConnection`] ready to accept commands via its
+    /// [`ConnectionHandle`].
     ///
-    /// Caller passes the already-handshaken halves of the TCP/TLS
-    /// stream plus the negotiated handshake state. Connection setup
-    /// (TLS upgrade, hello exchange) lives in
-    /// [`crate::native::connection::NativeConnection::open`] for now;
-    /// this constructor takes the post-handshake state.
-    #[allow(dead_code)] // wired by NativeConnection migration in next commit
+    /// This mirrors [`crate::native::connection::NativeConnection::open`]
+    /// for the actor-backed path. Pool integration (and the migration
+    /// of `NativeConnection` itself to delegate to this) live in
+    /// later commits on this branch.
+    pub(crate) async fn open(
+        addr: &SocketAddr,
+        database: &str,
+        username: &str,
+        password: &str,
+        compression: NativeCompressionMethod,
+        settings: Vec<(String, String)>,
+        tls: &TlsConfig,
+    ) -> Result<OwnedConnection> {
+        let stream = connect_stream(addr, tls).await?;
+        let (read_half, write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::with_capacity(CONN_READ_BUFFER, read_half);
+        let mut writer = BufWriter::with_capacity(CONN_WRITE_BUFFER, write_half);
+
+        // ClickHouse hello/addendum exchange.
+        writer::send_hello(&mut writer, database, username, password).await?;
+        let chunked_modes = (
+            ChunkedProtocolMode::default(),
+            ChunkedProtocolMode::default(),
+        );
+        let server_hello =
+            reader::read_hello(&mut reader, DBMS_TCP_PROTOCOL_VERSION, chunked_modes).await?;
+        writer::send_addendum(&mut writer, &server_hello).await?;
+
+        // Hand the already-wrapped halves to spawn — keeps any bytes
+        // that landed in the BufReader during the hello exchange. We
+        // don't unwrap to raw halves because that would discard the
+        // BufReader's internal buffer.
+        Ok(Self::spawn_buffered(
+            reader,
+            writer,
+            server_hello,
+            compression,
+            settings,
+            DEFAULT_KEEPALIVE,
+        ))
+    }
+
+    /// Same as [`open`](Self::open) but with already-handshaken halves.
+    ///
+    /// Used by tests that simulate the server side directly. Production
+    /// callers use [`open`](Self::open).
+    #[allow(dead_code)] // used by tests
     pub(crate) fn spawn(
         reader_half: ReadHalf<MaybeTlsStream>,
         writer_half: WriteHalf<MaybeTlsStream>,
@@ -677,7 +724,29 @@ impl ConnectionActor {
         settings: Vec<(String, String)>,
         keepalive: Duration,
     ) -> OwnedConnection {
+        let reader = BufReader::with_capacity(CONN_READ_BUFFER, reader_half);
         let writer = BufWriter::with_capacity(CONN_WRITE_BUFFER, writer_half);
+        Self::spawn_buffered(
+            reader,
+            writer,
+            server_hello,
+            compression,
+            settings,
+            keepalive,
+        )
+    }
+
+    /// Spawn an actor over already-buffered halves. Used by
+    /// [`open`](Self::open) so any bytes that landed in the
+    /// BufReader during the hello exchange aren't lost.
+    fn spawn_buffered(
+        reader: BufReader<ReadHalf<MaybeTlsStream>>,
+        writer: BufWriter<WriteHalf<MaybeTlsStream>>,
+        server_hello: ServerHello,
+        compression: NativeCompressionMethod,
+        settings: Vec<(String, String)>,
+        keepalive: Duration,
+    ) -> OwnedConnection {
         let server_hello = Arc::new(server_hello);
         let poisoned = Arc::new(AtomicBool::new(false));
 
@@ -685,12 +754,7 @@ impl ConnectionActor {
         // packet (or error) to pkt_tx until the socket closes.
         let (pkt_tx, pkt_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
         let revision = server_hello.revision_version;
-        let reader_handle = tokio::spawn(reader_task(
-            BufReader::with_capacity(CONN_READ_BUFFER, reader_half),
-            pkt_tx,
-            revision,
-            compression,
-        ));
+        let reader_handle = tokio::spawn(reader_task(reader, pkt_tx, revision, compression));
 
         let actor = ConnectionActor {
             writer,
@@ -1075,6 +1139,27 @@ fn merge_settings(base: &[(String, String)], extra: &[(String, String)]) -> Vec<
         }
     }
     merged
+}
+
+/// Dispatch TCP vs TLS connection based on config.
+///
+/// Mirrors `NativeConnection::connect_stream` but as a free function
+/// so the actor module doesn't have to reach into connection.rs's
+/// inherent impl. Same logic, kept in sync by hand for now —
+/// consolidation lands when `NativeConnection` itself migrates.
+#[cfg(feature = "native-tls-rustls")]
+async fn connect_stream(addr: &SocketAddr, tls: &TlsConfig) -> Result<MaybeTlsStream> {
+    match tls {
+        Some((config, server_name)) => {
+            tcp::connect_tls(addr, config.clone(), server_name.clone()).await
+        }
+        None => tcp::connect(addr).await,
+    }
+}
+
+#[cfg(not(feature = "native-tls-rustls"))]
+async fn connect_stream(addr: &SocketAddr, _tls: &TlsConfig) -> Result<MaybeTlsStream> {
+    tcp::connect(addr).await
 }
 
 /// Background reader sub-task. Loops on `read_packet` until any error
