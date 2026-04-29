@@ -1,21 +1,33 @@
-//! Connection management for ClickHouse native TCP protocol.
+//! Connection facade for the native TCP transport.
 //!
-//! Single-connection MVP -- handles handshake, query execution, and packet
-//! reading over a buffered TCP stream.
+//! `NativeConnection` is a thin compatibility wrapper around
+//! [`crate::native::connection_actor::OwnedConnection`] / [`ConnectionHandle`]:
+//! all I/O lives in the actor's background task, and `NativeConnection`'s
+//! public(crate) methods delegate via the handle.
+//!
+//! The wrapper exists so the rest of the crate (pool, insert, cursor,
+//! client, query) keeps the existing `&mut NativeConnection` API
+//! surface — but every protocol operation now goes through the actor,
+//! which gives us:
+//! - protocol-level Cancel on caller-future drop
+//! - full-duplex INSERT exception detection
+//! - cancel-safe writes (caller's timeout doesn't strand the socket)
+//! - reliable EOF / liveness via the actor's read loop (no more
+//!   `noop_waker` / `poll_read` poll-trick)
+//!
+//! The `writer_mut()` / `reader_mut()` raw accessors of the previous
+//! design are intentionally removed — they would let callers bypass
+//! the actor's serialisation. Cursor and `fetch_string_pairs` now use
+//! [`ConnectionHandle::execute_stream`] for streaming results.
 
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
 
-use tokio::io::{AsyncRead, BufReader, BufWriter, ReadBuf};
-
-use crate::error::{Error, Result};
-use crate::native::protocol::{
-    ChunkedProtocolMode, DBMS_TCP_PROTOCOL_VERSION, NativeCompressionMethod, ServerHello,
-};
-use crate::native::reader::{self, ServerPacket};
-use crate::native::tcp::{self, CONN_READ_BUFFER, CONN_WRITE_BUFFER, MaybeTlsStream};
-use crate::native::writer;
+use crate::error::Result;
+use crate::native::connection_actor::{ConnectionActor, ConnectionHandle, OwnedConnection};
+use crate::native::protocol::{NativeCompressionMethod, ServerHello};
+use crate::native::reader::ServerPacket;
+use crate::native::tcp::MaybeTlsStream;
+use tokio::sync::mpsc;
 
 /// TLS configuration for native connections.
 ///
@@ -30,23 +42,28 @@ pub(crate) type TlsConfig = Option<(
 #[cfg(not(feature = "native-tls-rustls"))]
 pub(crate) type TlsConfig = ();
 
-/// A single native TCP connection to ClickHouse.
+// Suppress an "unused" warning for MaybeTlsStream when the file is
+// compiled without native-tls-rustls (the actor uses it directly via
+// the tcp module).
+#[allow(dead_code)]
+type _SuppressUnusedMaybeTlsStream = MaybeTlsStream;
+
+/// A single native TCP connection to ClickHouse, backed by the
+/// background-task connection actor. All protocol operations delegate
+/// to the actor via its [`ConnectionHandle`].
 pub(crate) struct NativeConnection {
-    reader: BufReader<tokio::io::ReadHalf<MaybeTlsStream>>,
-    writer: BufWriter<tokio::io::WriteHalf<MaybeTlsStream>>,
-    server_hello: ServerHello,
+    /// RAII owner of the actor + reader sub-task. Drops abort cleanly
+    /// when this NativeConnection is dropped.
+    owned: OwnedConnection,
+    /// Cheap-clone handle for the protocol method delegations.
+    handle: ConnectionHandle,
+    /// Cached at open time so `compression()` doesn't need to round-trip
+    /// to the actor.
     compression: NativeCompressionMethod,
-    settings: Vec<(String, String)>,
-    /// Set to `true` by [`crate::native::pool::PooledConnection::discard`] to
-    /// prevent this connection being returned to the idle pool on drop.
-    pub(crate) poisoned: bool,
 }
 
 impl NativeConnection {
-    /// Connect and perform the handshake.
-    ///
-    /// When `tls_config` is `Some(...)` (requires `native-tls-rustls` feature),
-    /// the TCP socket is wrapped in TLS before the ClickHouse handshake.
+    /// Connect, perform the handshake, and spawn the background actor.
     pub(crate) async fn open(
         addr: &SocketAddr,
         database: &str,
@@ -56,81 +73,50 @@ impl NativeConnection {
         settings: Vec<(String, String)>,
         tls: &TlsConfig,
     ) -> Result<Self> {
-        let stream = Self::connect_stream(addr, tls).await?;
-        let (read_half, write_half) = tokio::io::split(stream);
-        let mut reader = BufReader::with_capacity(CONN_READ_BUFFER, read_half);
-        let mut writer = BufWriter::with_capacity(CONN_WRITE_BUFFER, write_half);
-
-        // Send hello
-        writer::send_hello(&mut writer, database, username, password).await?;
-
-        // Read hello response
-        let chunked_modes = (
-            ChunkedProtocolMode::default(),
-            ChunkedProtocolMode::default(),
-        );
-        let server_hello =
-            reader::read_hello(&mut reader, DBMS_TCP_PROTOCOL_VERSION, chunked_modes).await?;
-
-        // Send addendum
-        writer::send_addendum(&mut writer, &server_hello).await?;
-
-        Ok(Self {
-            reader,
-            writer,
-            server_hello,
+        let owned = ConnectionActor::open(
+            addr,
+            database,
+            username,
+            password,
             compression,
             settings,
-            poisoned: false,
+            tls,
+        )
+        .await?;
+        let handle = owned.handle();
+        Ok(Self {
+            owned,
+            handle,
+            compression,
         })
     }
 
-    /// Returns `true` if this connection has been marked as broken and should
-    /// not be returned to the idle pool.
-    #[allow(dead_code)] // Pool recycler accesses `conn.poisoned` directly; method kept for external callers
+    /// True when the underlying actor has been marked broken or has exited.
+    /// Used by the pool's recycle hook.
+    #[allow(dead_code)] // Pool recycler uses check_alive(); this is the symmetric query
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.poisoned
+        !self.handle.is_alive()
     }
 
-    /// Non-blocking liveness check for pool recycling.
+    /// Pool-recycle liveness check.
     ///
-    /// Returns `false` (connection should be discarded) if:
-    /// - the connection is poisoned
-    /// - the `BufReader` has unread bytes (leftover data from a previous query)
-    /// - the TCP socket reports EOF (server closed the connection)
-    /// - the TCP socket has unexpected data ready (protocol misalignment)
-    ///
-    /// Returns `true` only when the socket is clean and idle (no pending bytes).
+    /// Returns `true` when the actor is still running and the
+    /// connection has not been poisoned. Replaces the previous
+    /// `noop_waker` + `poll_read` poll-trick — the actor's read loop
+    /// is the canonical source of truth for socket health.
     pub(crate) fn check_alive(&mut self) -> bool {
-        if self.poisoned {
-            return false;
-        }
-        // Leftover bytes in the read buffer mean a previous query didn't drain
-        // completely -- the connection is in an unknown state.
-        if !self.reader.buffer().is_empty() {
-            return false;
-        }
-        // Non-blocking poll: detect EOF or unexpected data without blocking.
-        // A Pending result means the socket is idle -> connection is alive.
-        let mut buf = [0u8; 1];
-        let mut read_buf = ReadBuf::new(&mut buf);
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        match Pin::new(&mut self.reader).poll_read(&mut cx, &mut read_buf) {
-            Poll::Pending => true,   // idle -- connection is healthy
-            Poll::Ready(_) => false, // EOF or unexpected data -- discard
-        }
+        self.handle.is_alive()
     }
 
-    /// Get the server hello info.
+    /// Get the server hello info (immutable after handshake).
     #[allow(unused)]
     pub(crate) fn server_hello(&self) -> &ServerHello {
-        &self.server_hello
+        self.handle.server_hello()
     }
 
     /// Negotiated server revision.
     pub(crate) fn server_revision(&self) -> u64 {
-        self.server_hello.revision_version
+        self.handle.server_revision()
     }
 
     /// Compression method in use.
@@ -138,40 +124,17 @@ impl NativeConnection {
         self.compression
     }
 
-    /// Dispatch TCP vs TLS connection based on config.
-    #[cfg(feature = "native-tls-rustls")]
-    async fn connect_stream(addr: &SocketAddr, tls: &TlsConfig) -> Result<MaybeTlsStream> {
-        match tls {
-            Some((config, server_name)) => {
-                tcp::connect_tls(addr, config.clone(), server_name.clone()).await
-            }
-            None => tcp::connect(addr).await,
-        }
+    /// Mark this connection as broken so the pool drops it on recycle.
+    /// Idempotent.
+    pub(crate) fn poison(&mut self) {
+        self.handle.poison();
     }
 
-    #[cfg(not(feature = "native-tls-rustls"))]
-    async fn connect_stream(addr: &SocketAddr, _tls: &TlsConfig) -> Result<MaybeTlsStream> {
-        tcp::connect(addr).await
-    }
-
-    /// Mutable access to the write half for sending packets.
-    pub(crate) fn writer_mut(&mut self) -> &mut BufWriter<tokio::io::WriteHalf<MaybeTlsStream>> {
-        &mut self.writer
-    }
-
-    /// Mutable access to the read half for receiving packets.
-    pub(crate) fn reader_mut(&mut self) -> &mut BufReader<tokio::io::ReadHalf<MaybeTlsStream>> {
-        &mut self.reader
-    }
-
-    /// Activate ClickHouse roles for this session.
+    /// Activate ClickHouse roles for this session via `SET ROLE`.
     ///
-    /// Sends `SET ROLE `role1`, `role2`, ...` as a plain query and waits
-    /// for `EndOfStream`. Called once per new connection by the pool manager,
-    /// immediately after the handshake, before the connection is handed to
-    /// any query or insert.
-    ///
-    /// Role names are backtick-escaped to prevent injection.
+    /// Called once per new connection by the pool manager, immediately
+    /// after the handshake. Role names are backtick-escaped to prevent
+    /// injection.
     pub(crate) async fn set_roles(&mut self, roles: &[String]) -> Result<()> {
         debug_assert!(!roles.is_empty(), "set_roles called with empty slice");
         let mut sql = String::from("SET ROLE ");
@@ -186,92 +149,31 @@ impl NativeConnection {
     }
 
     /// Execute a query and read all response packets until EndOfStream.
-    #[allow(dead_code)] // Convenience wrapper over execute_query_with; kept for callers that don't need query_id/settings
+    #[allow(dead_code)] // Convenience wrapper over execute_query_with
     pub(crate) async fn execute_query(&mut self, query: &str) -> Result<()> {
-        self.execute_query_with("", query, &[]).await
+        self.handle.execute_query("", query, &[]).await
     }
 
     /// Execute a query with an explicit query ID and per-query settings.
     ///
-    /// `query_id` is sent verbatim in the query packet header; pass `""` to
-    /// let the server generate its own ID.
-    ///
-    /// `extra_settings` are appended after the connection-level settings.
-    /// Callers that want per-query settings to *override* client settings
-    /// should perform the merge themselves before calling this method.
+    /// `query_id` is sent verbatim in the query packet header; pass `""`
+    /// to let the server generate its own ID. `extra_settings` are
+    /// merged over the connection-level settings.
     pub(crate) async fn execute_query_with(
         &mut self,
         query_id: &str,
         query: &str,
         extra_settings: &[(String, String)],
     ) -> Result<()> {
-        let revision = self.server_hello.revision_version;
-        let compression = self.compression;
-
-        // Merge connection-level settings with per-query overrides.
-        let settings = merge_settings(&self.settings, extra_settings);
-
-        writer::send_query(
-            &mut self.writer,
-            query_id,
-            query,
-            &settings,
-            revision,
-            compression,
-        )
-        .await?;
-        writer::send_empty_block(&mut self.writer, compression).await?;
-
-        loop {
-            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
-            match packet {
-                ServerPacket::EndOfStream => break,
-                ServerPacket::Exception(err) => {
-                    return Err(Error::BadResponse(err.to_string()));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
+        self.handle
+            .execute_query(query_id, query, extra_settings)
+            .await
     }
 
-    /// Begin an INSERT operation.
-    ///
-    /// Sends `INSERT INTO table(cols) FORMAT Native` + an empty data block,
-    /// then reads server packets until the schema Data block (0 rows) arrives.
-    /// Returns the column headers `(name, type_name)` declared by the server.
+    /// Begin an INSERT operation. Returns the column headers
+    /// `(name, type_name)` declared by the server.
     pub(crate) async fn begin_insert(&mut self, query: &str) -> Result<Vec<(String, String)>> {
-        let revision = self.server_hello.revision_version;
-        let compression = self.compression;
-
-        writer::send_query(
-            &mut self.writer,
-            "",
-            query,
-            &self.settings,
-            revision,
-            compression,
-        )
-        .await?;
-        writer::send_empty_block(&mut self.writer, compression).await?;
-
-        loop {
-            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
-            match packet {
-                reader::ServerPacket::Data(block) => {
-                    return Ok(block
-                        .column_headers
-                        .into_iter()
-                        .map(|h| (h.name, h.type_name))
-                        .collect());
-                }
-                reader::ServerPacket::Exception(err) => {
-                    return Err(Error::BadResponse(err.to_string()));
-                }
-                _ => {} // skip Progress, ProfileInfo, etc.
-            }
-        }
+        self.handle.begin_insert(query).await
     }
 
     /// Send one data block during an INSERT.
@@ -283,79 +185,50 @@ impl NativeConnection {
         num_columns: usize,
         num_rows: usize,
     ) -> Result<()> {
-        writer::send_data_block(
-            &mut self.writer,
-            num_columns,
-            num_rows,
-            column_bytes,
-            self.compression,
-        )
-        .await
+        // The actor's command takes owned bytes (Send across mpsc).
+        // For now we copy; future enhancement: take Bytes / Arc<[u8]>
+        // through the channel to avoid this allocation in the hot path.
+        self.handle
+            .send_insert_block(column_bytes.to_vec(), num_columns, num_rows)
+            .await
     }
 
-    /// Finish an INSERT: send the empty terminator block and consume until
-    /// `EndOfStream` (or surface any server exception).
+    /// Finish an INSERT: send the empty terminator, drain to EndOfStream.
     pub(crate) async fn finish_insert(&mut self) -> Result<()> {
-        let revision = self.server_hello.revision_version;
-        let compression = self.compression;
-
-        writer::send_empty_block(&mut self.writer, compression).await?;
-
-        loop {
-            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
-            match packet {
-                reader::ServerPacket::EndOfStream => return Ok(()),
-                reader::ServerPacket::Exception(err) => {
-                    return Err(Error::BadResponse(err.to_string()));
-                }
-                _ => {} // skip Progress, ProfileInfo, etc.
-            }
-        }
+        self.handle.finish_insert().await
     }
 
     /// Send ping and wait for pong.
     pub(crate) async fn ping(&mut self) -> Result<()> {
-        let revision = self.server_hello.revision_version;
-        let compression = self.compression;
-
-        writer::send_ping(&mut self.writer).await?;
-        loop {
-            let packet = reader::read_packet(&mut self.reader, revision, compression).await?;
-            match packet {
-                ServerPacket::Pong => return Ok(()),
-                ServerPacket::Exception(err) => {
-                    return Err(Error::BadResponse(err.to_string()));
-                }
-                _ => continue,
-            }
-        }
+        self.handle.ping().await
     }
-}
 
-/// Merge `base` settings with `extra`, where `extra` overrides duplicates.
-///
-/// Returns a `Vec` containing all entries from `base` (with any keys that also
-/// appear in `extra` replaced by the `extra` value), followed by any `extra`
-/// keys that were not present in `base`.
-fn merge_settings(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String, String)> {
-    if extra.is_empty() {
-        return base.to_vec();
+    /// Begin a streaming SELECT. Returns the receive end of an mpsc
+    /// channel that the actor will push every received `ServerPacket`
+    /// into until EndOfStream or Exception.
+    ///
+    /// **Cancel-on-drop:** drop the returned receiver to abort the
+    /// stream — the actor sends the protocol Cancel packet, drains to
+    /// EndOfStream, and the connection stays usable in the pool.
+    pub(crate) async fn execute_stream(
+        &mut self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<Result<ServerPacket>>> {
+        self.handle
+            .execute_stream(query_id, query, extra_settings, capacity)
+            .await
     }
-    let mut merged = base.to_vec();
-    for (k, v) in extra {
-        if let Some(slot) = merged.iter_mut().find(|(ek, _)| ek == k) {
-            slot.1 = v.clone();
-        } else {
-            merged.push((k.clone(), v.clone()));
-        }
-    }
-    merged
-}
 
-/// A no-op [`Waker`] used for non-blocking `poll_read` calls in `check_alive`.
-///
-/// The waker never schedules anything -- it is used purely to drive a single
-/// synchronous poll without registering for wake-up notifications.
-fn noop_waker() -> Waker {
-    Waker::noop().clone()
+    /// Take ownership of the underlying [`OwnedConnection`] for
+    /// explicit shutdown. Consumes the wrapper.
+    ///
+    /// Currently only used by tests; production code lets the wrapper
+    /// drop and the actor exit naturally.
+    #[allow(dead_code)]
+    pub(crate) fn into_owned(self) -> OwnedConnection {
+        self.owned
+    }
 }

@@ -6,6 +6,8 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 
+use tokio::sync::mpsc;
+
 use crate::error::{Error, Result};
 use crate::native::callbacks::QueryCallbacks;
 use crate::native::client::NativeClient;
@@ -13,6 +15,11 @@ use crate::native::pool::PooledConnection;
 use crate::native::reader::ServerPacket;
 use crate::row::{RowOwned, RowRead};
 use crate::rowbinary;
+
+/// Per-cursor packet buffer capacity. Bigger = more read-ahead;
+/// smaller = tighter backpressure. 64 covers typical SELECT
+/// Data/Progress interleaving without stalling.
+const STREAM_CAPACITY: usize = 64;
 
 /// A cursor that emits owned deserialized rows from a native TCP query.
 ///
@@ -36,28 +43,30 @@ pub struct NativeRowCursor<T: RowOwned + RowRead> {
 enum CursorState {
     /// Initial state -- connection not yet acquired from pool.
     NotStarted,
-    /// Connection open, reading packets.
-    Reading(Box<PooledConnection>),
+    /// Stream open. The mpsc receiver is fed by the connection
+    /// actor's read loop. The PooledConnection is held here too so
+    /// the pool ownership stays correct for the cursor's lifetime —
+    /// dropping the cursor drops the receiver (actor sends Cancel +
+    /// drains) AND the connection (returns to pool clean).
+    Reading {
+        rx: mpsc::Receiver<Result<ServerPacket>>,
+        // Held for RAII pool return; not read after construction.
+        _conn: Box<PooledConnection>,
+    },
     /// EndOfStream received -- no more data.
     Done,
 }
 
-impl<T: RowOwned + RowRead> Drop for NativeRowCursor<T> {
-    /// Discard the connection if the stream was never fully consumed.
-    ///
-    /// Dropping a cursor mid-stream (e.g. after `fetch_one`) without calling
-    /// `drain()` first would return a connection with unread bytes to the pool.
-    /// Marking it poisoned here ensures deadpool drops it instead of recycling.
-    fn drop(&mut self) {
-        if let CursorState::Reading(conn) =
-            std::mem::replace(&mut self.state, CursorState::Done)
-        {
-            // We can't async-drain here, so discard the connection.
-            let mut conn = conn;
-            conn.discard();
-        }
-    }
-}
+// No explicit Drop needed any more — the actor's cancel-on-drop
+// semantics handle cleanup. When CursorState::Reading drops:
+// 1. The mpsc Receiver drops -> actor sees results.is_closed() ->
+//    sends protocol Cancel + drains to EndOfStream.
+// 2. The PooledConnection drops -> deadpool returns it to the pool.
+// 3. Pool's recycle hook checks is_alive() -> still true -> reused.
+//
+// This replaces the previous "discard the connection on partial read"
+// pattern with cleanup that keeps the connection alive for the next
+// caller.
 
 impl<T: RowOwned + RowRead> NativeRowCursor<T> {
     pub(crate) fn new(
@@ -82,36 +91,30 @@ impl<T: RowOwned + RowRead> NativeRowCursor<T> {
     /// Consume all remaining packets until `EndOfStream`, allowing the
     /// underlying connection to be returned to the pool in a clean state.
     ///
-    /// Must be called after a partial read (e.g. after `fetch_one` got its row)
-    /// to prevent the half-read connection from being recycled with unread data.
+    /// With the actor-backed cursor this is no longer strictly required
+    /// — dropping the cursor mid-stream triggers actor-side Cancel + drain
+    /// automatically. `drain` is kept for callers that want to know the
+    /// stream finished cleanly (and for `fetch_one` which prefers
+    /// explicit drain to avoid the Cancel round-trip).
     pub(crate) async fn drain(&mut self) -> Result<()> {
         loop {
-            match &self.state {
+            match &mut self.state {
                 CursorState::Done | CursorState::NotStarted => return Ok(()),
-                CursorState::Reading(_) => {}
-            }
-            let CursorState::Reading(conn) = &mut self.state else {
-                unreachable!()
-            };
-            let revision = conn.server_revision();
-            let compression = conn.compression();
-            let packet =
-                crate::native::reader::read_packet(conn.reader_mut(), revision, compression)
-                    .await;
-            match packet {
-                Ok(ServerPacket::EndOfStream) => {
-                    self.state = CursorState::Done;
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    if let CursorState::Reading(mut conn) =
-                        std::mem::replace(&mut self.state, CursorState::Done)
-                    {
-                        conn.discard();
+                CursorState::Reading { rx, .. } => match rx.recv().await {
+                    Some(Ok(ServerPacket::EndOfStream)) | None => {
+                        self.state = CursorState::Done;
+                        return Ok(());
                     }
-                    return Err(e);
-                }
+                    Some(Ok(ServerPacket::Exception(err))) => {
+                        self.state = CursorState::Done;
+                        return Err(Error::BadResponse(err.to_string()));
+                    }
+                    Some(Ok(_)) => continue, // discard Data / Progress / ProfileInfo
+                    Some(Err(e)) => {
+                        self.state = CursorState::Done;
+                        return Err(e);
+                    }
+                },
             }
         }
     }
@@ -134,63 +137,54 @@ impl<T: RowOwned + RowRead> NativeRowCursor<T> {
 
                 CursorState::NotStarted => {
                     let mut conn = self.client.acquire().await?;
-                    let revision = conn.server_revision();
-                    let compression = conn.compression();
-                    crate::native::writer::send_query(
-                        conn.writer_mut(),
-                        &self.query_id,
-                        &self.sql,
-                        &self.settings,
-                        revision,
-                        compression,
-                    )
-                    .await?;
-                    crate::native::writer::send_empty_block(conn.writer_mut(), compression).await?;
-                    self.state = CursorState::Reading(Box::new(conn));
+                    let rx = conn
+                        .execute_stream(&self.query_id, &self.sql, &self.settings, STREAM_CAPACITY)
+                        .await?;
+                    self.state = CursorState::Reading {
+                        rx,
+                        _conn: Box::new(conn),
+                    };
                 }
 
-                CursorState::Reading(conn) => {
-                    let revision = conn.server_revision();
-                    let compression = conn.compression();
-                    let packet = crate::native::reader::read_packet(
-                        conn.reader_mut(),
-                        revision,
-                        compression,
-                    )
-                    .await?;
-
-                    match packet {
-                        ServerPacket::EndOfStream => {
+                CursorState::Reading { rx, .. } => {
+                    match rx.recv().await {
+                        Some(Ok(ServerPacket::EndOfStream)) => {
                             self.state = CursorState::Done;
-                            // Connection is returned to pool automatically when
-                            // the old CursorState::Reading is dropped here.
+                            // Connection auto-returns to pool when state drops.
                         }
-                        ServerPacket::Data(block) => {
+                        Some(Ok(ServerPacket::Data(block))) => {
                             if block.num_rows > 0 {
                                 self.row_buf.extend(block.row_data);
                             }
                         }
-                        ServerPacket::Exception(err) => {
-                            // Discard the connection -- the query didn't complete
-                            // cleanly; subsequent reads on this conn would be misaligned.
-                            if let CursorState::Reading(mut conn) =
-                                std::mem::replace(&mut self.state, CursorState::Done)
-                            {
-                                conn.discard();
-                            }
+                        Some(Ok(ServerPacket::Exception(err))) => {
+                            // Actor has already drained the stream on its side;
+                            // connection stays alive in the pool.
+                            self.state = CursorState::Done;
                             return Err(Error::BadResponse(err.to_string()));
                         }
-                        ServerPacket::Progress(p) => {
+                        Some(Ok(ServerPacket::Progress(p))) => {
                             if let Some(cb) = &self.callbacks.on_progress {
                                 cb(&p);
                             }
                         }
-                        ServerPacket::ProfileInfo(pi) => {
+                        Some(Ok(ServerPacket::ProfileInfo(pi))) => {
                             if let Some(cb) = &self.callbacks.on_profile_info {
                                 cb(&pi);
                             }
                         }
-                        _ => {}
+                        Some(Ok(_)) => {} // ignore other packet types
+                        Some(Err(e)) => {
+                            // I/O error from the actor's read loop —
+                            // surface and end the cursor.
+                            self.state = CursorState::Done;
+                            return Err(e);
+                        }
+                        None => {
+                            // Channel closed unexpectedly (actor exited).
+                            self.state = CursorState::Done;
+                            return Err(Error::Custom("connection actor closed mid-stream".into()));
+                        }
                     }
                 }
             }

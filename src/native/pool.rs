@@ -125,7 +125,7 @@ impl PooledConnection {
     /// Call this after any I/O error or incomplete protocol exchange that
     /// leaves the connection in an unrecoverable state.
     pub(crate) fn discard(&mut self) {
-        self.inner.poisoned = true;
+        self.inner.poison();
     }
 }
 

@@ -534,30 +534,23 @@ impl NativeClient {
 
 /// Execute a query expected to return two `String` columns and collect all rows
 /// as `Vec<(String, String)>`, parsing RowBinary directly without serde.
+///
+/// Uses the actor's streaming path via [`NativeConnection::execute_stream`].
+/// Settings (per-query) are passed through; the connection-level settings
+/// are merged inside the actor.
 async fn fetch_string_pairs(client: &NativeClient, sql: &str) -> Result<Vec<(String, String)>> {
     use crate::native::reader::ServerPacket;
 
     let mut conn = client.acquire().await?;
-    let revision = conn.server_revision();
-    let compression = conn.compression();
-
-    crate::native::writer::send_query(
-        conn.writer_mut(),
-        "",
-        sql,
-        client.settings(),
-        revision,
-        compression,
-    )
-    .await?;
-    crate::native::writer::send_empty_block(conn.writer_mut(), compression).await?;
+    // Pass client settings through as the per-query overrides — they
+    // have already been merged with the connection-level settings at
+    // open() time, so passing them again is a no-op merge inside the
+    // actor.
+    let mut rx = conn.execute_stream("", sql, client.settings(), 64).await?;
 
     let mut result = Vec::new();
-
-    loop {
-        let packet =
-            crate::native::reader::read_packet(conn.reader_mut(), revision, compression).await?;
-        match packet {
+    while let Some(pkt) = rx.recv().await {
+        match pkt? {
             ServerPacket::Data(block) if block.num_rows > 0 => {
                 // Each element in row_data is one complete RowBinary row.
                 // Two String columns: parse varuint(len)+bytes twice per row.
