@@ -15,6 +15,7 @@ use crate::{
 };
 
 const MAX_COMPRESSED_SIZE: u32 = 1024 * 1024 * 1024;
+const MAX_UNCOMPRESSED_SIZE: u32 = 1024 * 1024 * 1024;
 
 pub(crate) struct Lz4Decoder<S> {
     stream: S,
@@ -101,6 +102,10 @@ impl Lz4Meta {
 
         if compressed_size > MAX_COMPRESSED_SIZE {
             return Err(Error::Decompression("too big compressed data".into()));
+        }
+
+        if uncompressed_size > MAX_UNCOMPRESSED_SIZE {
+            return Err(Error::Decompression("too big uncompressed data".into()));
         }
 
         Ok(Lz4Meta {
@@ -246,4 +251,25 @@ fn it_compresses() {
 
     let actual = compress(&source).unwrap();
     assert_eq!(actual, expected);
+}
+
+// A server (or attacker proxying a server response) declaring a giant
+// `uncompressed_size` would otherwise cause `lz4_flex` to allocate a
+// matching output buffer before any decode work can fail. Reject the
+// metadata up front so the allocation never happens.
+#[test]
+fn it_rejects_too_big_uncompressed_size() {
+    let mut bytes = vec![0u8; LZ4_CHECKSUM_SIZE];
+    bytes.push(LZ4_MAGIC);
+    bytes.extend_from_slice(&100u32.to_le_bytes()); // compressed_size: small
+    bytes.extend_from_slice(&(MAX_UNCOMPRESSED_SIZE + 1).to_le_bytes()); // uncompressed_size: over cap
+
+    match Lz4Meta::read(&bytes) {
+        Err(Error::Decompression(msg)) => assert!(
+            msg.to_string().contains("uncompressed"),
+            "error should mention uncompressed size, got: {msg}"
+        ),
+        Err(other) => panic!("expected Decompression error, got {other:?}"),
+        Ok(_) => panic!("expected Lz4Meta::read to reject oversize uncompressed_size"),
+    }
 }

@@ -1,6 +1,7 @@
 use crate::insert_formatted::{BufInsertFormatted, InsertFormatted};
 use crate::row_metadata::RowMetadata;
 use crate::rowbinary::{serialize_row_binary, serialize_with_validation};
+use crate::sql::escape;
 use crate::{
     Client, RowWrite,
     error::Result,
@@ -8,8 +9,20 @@ use crate::{
     row::{self, Row},
 };
 use clickhouse_types::put_rbwnat_columns_header;
+use std::fmt::Write;
 use std::num::Saturating;
 use std::{future::Future, marker::PhantomData, time::Duration};
+
+// Build the `INSERT INTO ...` SQL for a given table, fields, and format.
+// The table name is escaped as a quoted identifier so that a caller-supplied
+// name containing backticks or other special characters cannot inject SQL.
+fn build_insert_sql(table: &str, fields: &str, format: &str) -> String {
+    let mut sql = String::with_capacity(32 + table.len() + fields.len() + format.len());
+    sql.push_str("INSERT INTO ");
+    escape::identifier(table, &mut sql).expect("write to String never fails");
+    write!(sql, "({fields}) FORMAT {format}").expect("write to String never fails");
+    sql
+}
 
 // The desired max frame size.
 const BUFFER_SIZE: usize = 256 * 1024;
@@ -58,7 +71,7 @@ impl<T> Insert<T> {
         } else {
             formats::ROW_BINARY
         };
-        let sql = format!("INSERT INTO {table}({fields}) FORMAT {format}");
+        let sql = build_insert_sql(table, &fields, format);
 
         Self {
             insert: InsertFormatted::new(client, sql, Some(table))
@@ -250,5 +263,36 @@ impl<T> Insert<T> {
 
     fn abort(&mut self) {
         self.insert.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_insert_sql;
+    use crate::formats;
+
+    #[test]
+    fn it_escapes_backticks_in_table_name() {
+        let sql = build_insert_sql("evil`name", "id", formats::ROW_BINARY);
+        assert_eq!(sql, "INSERT INTO `evil\\`name`(id) FORMAT RowBinary");
+    }
+
+    #[test]
+    fn it_escapes_sql_injection_attempt_in_table_name() {
+        let sql = build_insert_sql(
+            "users`); DROP TABLE users; --",
+            "id, name",
+            formats::ROW_BINARY,
+        );
+        assert_eq!(
+            sql,
+            "INSERT INTO `users\\`); DROP TABLE users; --`(id, name) FORMAT RowBinary"
+        );
+    }
+
+    #[test]
+    fn it_wraps_simple_table_name_in_backticks() {
+        let sql = build_insert_sql("events", "id", formats::ROW_BINARY);
+        assert_eq!(sql, "INSERT INTO `events`(id) FORMAT RowBinary");
     }
 }
