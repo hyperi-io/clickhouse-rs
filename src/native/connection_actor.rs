@@ -115,11 +115,54 @@ pub(crate) enum ConnectionCmd {
         extra_settings: Vec<(String, String)>,
         reply: oneshot::Sender<Result<()>>,
     },
+
+    /// Begin an INSERT session. Sends `INSERT INTO ... FORMAT Native`,
+    /// reads the schema Data block (0 rows) the server returns, and
+    /// transitions the actor into [`InsertActive`](ActorState::InsertActive)
+    /// state. Subsequent commands other than `SendInsertBlock` /
+    /// `FinishInsert` are rejected with an error reply.
+    ///
+    /// Returns the column headers `(name, type_name)` declared by the
+    /// server.
+    BeginInsert {
+        query: String,
+        reply: oneshot::Sender<Result<Vec<(String, String)>>>,
+    },
+
+    /// Send one data block during an active INSERT.
+    ///
+    /// **Full-duplex correctness fix:** before sending the block, the
+    /// actor drains any packets the reader sub-task has buffered
+    /// (using `try_recv`, non-blocking). If a `ServerPacket::Exception`
+    /// has arrived (e.g. server detected a constraint violation from
+    /// the previous block), the insert is aborted immediately — no
+    /// more bytes go on the wire. Today's `NativeConnection` only
+    /// reads the response stream in `finish_insert()`, so a server
+    /// Exception isn't observed until potentially many MB later.
+    SendInsertBlock {
+        column_bytes: Vec<u8>,
+        num_columns: usize,
+        num_rows: usize,
+        reply: oneshot::Sender<Result<()>>,
+    },
+
+    /// Finish the active INSERT: send the empty terminator block,
+    /// drain to `EndOfStream`, and return to `Idle` state. After this
+    /// the connection is ready for any other command.
+    FinishInsert { reply: oneshot::Sender<Result<()>> },
     // Subsequent variants:
-    //   BeginInsert { query, reply: oneshot<Result<Vec<(String,String)>>> }
-    //   SendInsertBlock { column_bytes, num_columns, num_rows, reply: oneshot<Result<()>> }
-    //   FinishInsert { reply: oneshot<Result<()>> }
     //   ExecuteStream { query_id, query, extra_settings, results: mpsc<Result<ServerPacket>> }
+}
+
+/// Internal state machine — what is the actor in the middle of?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorState {
+    /// No operation in flight; all commands accepted.
+    Idle,
+    /// `BeginInsert` succeeded; only `SendInsertBlock` and
+    /// `FinishInsert` are accepted. Other commands receive an error
+    /// reply (`busy in INSERT session`).
+    InsertActive,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +260,77 @@ impl ConnectionHandle {
             .map_err(|_| Error::Custom("connection actor closed".into()))?;
         rx.await
             .map_err(|_| Error::Custom("connection actor dropped during query".into()))?
+    }
+
+    /// Begin an INSERT session. Sends the INSERT statement, reads the
+    /// schema Data block, returns the column headers
+    /// `(name, type_name)`. Subsequent commands other than
+    /// `send_insert_block` / `finish_insert` will be rejected until
+    /// the session ends.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor is closed.
+    /// - [`Error::BadResponse`] if the server rejects the statement.
+    pub(crate) async fn begin_insert(&self, query: &str) -> Result<Vec<(String, String)>> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::BeginInsert {
+                query: query.to_owned(),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Custom("connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("connection actor dropped during BeginInsert".into()))?
+    }
+
+    /// Send one data block during an active INSERT. The actor will
+    /// drain any pending server packets first and abort early if the
+    /// server has reported an Exception (full-duplex correctness fix).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor is closed or in the wrong
+    ///   state (use [`begin_insert`](Self::begin_insert) first).
+    /// - [`Error::BadResponse`] if the server has reported an Exception
+    ///   for this INSERT.
+    pub(crate) async fn send_insert_block(
+        &self,
+        column_bytes: Vec<u8>,
+        num_columns: usize,
+        num_rows: usize,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::SendInsertBlock {
+                column_bytes,
+                num_columns,
+                num_rows,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Custom("connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("connection actor dropped during SendInsertBlock".into()))?
+    }
+
+    /// Finish the active INSERT. Sends the empty terminator block,
+    /// drains to `EndOfStream`, returns the actor to `Idle` state.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor is closed or not in an INSERT
+    ///   session.
+    /// - [`Error::BadResponse`] if the server reports a final Exception.
+    pub(crate) async fn finish_insert(&self) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::FinishInsert { reply })
+            .await
+            .map_err(|_| Error::Custom("connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("connection actor dropped during FinishInsert".into()))?
     }
 }
 
@@ -326,15 +440,15 @@ impl Drop for OwnedConnection {
 pub(crate) struct ConnectionActor {
     writer: BufWriter<WriteHalf<MaybeTlsStream>>,
     pkt_rx: mpsc::Receiver<Result<ServerPacket>>,
-    #[allow(dead_code)] // used by ExecuteQuery / BeginInsert in next commits
     server_hello: Arc<ServerHello>,
-    #[allow(dead_code)]
     compression: NativeCompressionMethod,
-    #[allow(dead_code)]
     settings: Vec<(String, String)>,
     poisoned: Arc<AtomicBool>,
     keepalive: Duration,
     last_activity: Instant,
+    /// Protocol-state machine. Idle by default; transitions to
+    /// `InsertActive` on `BeginInsert` and back on `FinishInsert`.
+    state: ActorState,
 }
 
 impl CommandWorker for ConnectionActor {
@@ -351,29 +465,82 @@ impl CommandWorker for ConnectionActor {
     fn handle(&mut self, cmd: ConnectionCmd) -> impl std::future::Future<Output = ()> + Send + '_ {
         async move {
             self.last_activity = Instant::now();
-            match cmd {
-                ConnectionCmd::Ping { reply } => {
+            // State-aware dispatch: in InsertActive state only the
+            // INSERT continuation commands are accepted; everything
+            // else gets a "busy" error reply so callers don't silently
+            // hang.
+            match (cmd, self.state) {
+                (ConnectionCmd::Ping { reply }, ActorState::Idle) => {
                     let result = self.do_ping().await;
                     if result.is_err() {
                         self.poisoned.store(true, Ordering::Release);
                     }
                     let _ = reply.send(result);
                 }
-                ConnectionCmd::ExecuteQuery {
-                    query_id,
-                    query,
-                    extra_settings,
-                    reply,
-                } => {
+                (
+                    ConnectionCmd::ExecuteQuery {
+                        query_id,
+                        query,
+                        extra_settings,
+                        reply,
+                    },
+                    ActorState::Idle,
+                ) => {
                     let result = self
                         .do_execute_query(&query_id, &query, &extra_settings, reply)
                         .await;
                     if result.is_err() {
-                        // I/O failed (not just a server-side Exception) —
-                        // poison so the pool discards on recycle.
                         self.poisoned.store(true, Ordering::Release);
                     }
                 }
+                (ConnectionCmd::BeginInsert { query, reply }, ActorState::Idle) => {
+                    match self.do_begin_insert(&query).await {
+                        Ok(headers) => {
+                            self.state = ActorState::InsertActive;
+                            let _ = reply.send(Ok(headers));
+                        }
+                        Err(e) => {
+                            self.poisoned.store(true, Ordering::Release);
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                (
+                    ConnectionCmd::SendInsertBlock {
+                        column_bytes,
+                        num_columns,
+                        num_rows,
+                        reply,
+                    },
+                    ActorState::InsertActive,
+                ) => {
+                    let result = self
+                        .do_send_insert_block(&column_bytes, num_columns, num_rows)
+                        .await;
+                    if let Err(ref e) = result {
+                        // Distinguish I/O failure (poison) from
+                        // server-side Exception during INSERT (state
+                        // returns to Idle, but socket is fine — the
+                        // server has already drained on its side and
+                        // sent EndOfStream, which our drain consumed).
+                        if matches!(e, Error::BadResponse(_)) {
+                            self.state = ActorState::Idle;
+                        } else {
+                            self.poisoned.store(true, Ordering::Release);
+                        }
+                    }
+                    let _ = reply.send(result);
+                }
+                (ConnectionCmd::FinishInsert { reply }, ActorState::InsertActive) => {
+                    let result = self.do_finish_insert().await;
+                    if result.is_err() {
+                        self.poisoned.store(true, Ordering::Release);
+                    }
+                    self.state = ActorState::Idle;
+                    let _ = reply.send(result);
+                }
+                // Mismatched state — reject without disturbing the actor.
+                (cmd, state) => self.reject_for_state(cmd, state),
             }
         }
     }
@@ -459,6 +626,7 @@ impl ConnectionActor {
             server_hello: Arc::clone(&server_hello),
             compression,
             settings,
+            state: ActorState::Idle,
             poisoned: Arc::clone(&poisoned),
             keepalive,
             last_activity: Instant::now(),
@@ -568,6 +736,145 @@ impl ConnectionActor {
                     // for execute, not stream.
                     continue;
                 }
+            }
+        }
+    }
+
+    /// Begin an INSERT: send the INSERT statement + empty data block,
+    /// drain response packets until the server returns the schema
+    /// `Data` block (0 rows). Returns the column headers
+    /// `(name, type_name)` declared by the server.
+    async fn do_begin_insert(&mut self, query: &str) -> Result<Vec<(String, String)>> {
+        let revision = self.server_hello.revision_version;
+        let compression = self.compression;
+
+        writer::send_query(
+            &mut self.writer,
+            "",
+            query,
+            &self.settings,
+            revision,
+            compression,
+        )
+        .await?;
+        writer::send_empty_block(&mut self.writer, compression).await?;
+
+        loop {
+            let pkt = self.recv_packet().await?;
+            match pkt {
+                ServerPacket::Data(block) => {
+                    return Ok(block
+                        .column_headers
+                        .into_iter()
+                        .map(|h| (h.name, h.type_name))
+                        .collect());
+                }
+                ServerPacket::Exception(err) => {
+                    return Err(Error::BadResponse(err.to_string()));
+                }
+                _ => continue, // skip Progress/ProfileInfo
+            }
+        }
+    }
+
+    /// Send one data block during an active INSERT.
+    ///
+    /// **Full-duplex check:** before writing, drain any packets the
+    /// reader has buffered (non-blocking `try_recv`). If the server has
+    /// sent a `ServerPacket::Exception` (e.g. constraint violation
+    /// detected on a previous block), abort early — no point sending
+    /// another MB of data the server will reject.
+    ///
+    /// The drain also consumes any `Progress`/`ProfileInfo` packets
+    /// the server emits between blocks; they're not surfaced to the
+    /// caller (yet — observability hooks are a future enhancement).
+    async fn do_send_insert_block(
+        &mut self,
+        column_bytes: &[u8],
+        num_columns: usize,
+        num_rows: usize,
+    ) -> Result<()> {
+        // Drain any pending packets non-blockingly. This is the
+        // full-duplex correctness fix.
+        loop {
+            match self.pkt_rx.try_recv() {
+                Ok(Ok(ServerPacket::Exception(err))) => {
+                    // Server has rejected the insert. Drain any
+                    // remaining packets up to EndOfStream so the
+                    // socket stays clean.
+                    self.drain_to_eos().await;
+                    return Err(Error::BadResponse(err.to_string()));
+                }
+                Ok(Ok(_other)) => continue, // Progress / ProfileInfo / Log — discard
+                Ok(Err(e)) => return Err(e),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(Error::Custom("reader task exited mid-INSERT".into()));
+                }
+            }
+        }
+
+        writer::send_data_block(
+            &mut self.writer,
+            num_columns,
+            num_rows,
+            column_bytes,
+            self.compression,
+        )
+        .await
+    }
+
+    /// Finish an INSERT: send the empty terminator block, then drain
+    /// to `EndOfStream` (or surface any server-side Exception).
+    async fn do_finish_insert(&mut self) -> Result<()> {
+        writer::send_empty_block(&mut self.writer, self.compression).await?;
+        loop {
+            let pkt = self.recv_packet().await?;
+            match pkt {
+                ServerPacket::EndOfStream => return Ok(()),
+                ServerPacket::Exception(err) => {
+                    return Err(Error::BadResponse(err.to_string()));
+                }
+                _ => continue, // skip Progress/ProfileInfo
+            }
+        }
+    }
+
+    /// Best-effort drain of all packets up to EndOfStream. Used after
+    /// a server Exception during INSERT to keep the socket clean for
+    /// the next caller. Errors are swallowed — we're already in an
+    /// error path.
+    async fn drain_to_eos(&mut self) {
+        while let Some(Ok(pkt)) = self.pkt_rx.recv().await {
+            if matches!(pkt, ServerPacket::EndOfStream) {
+                return;
+            }
+        }
+    }
+
+    /// Reject a command sent in the wrong state with a clear error.
+    /// Caller's reply channel receives the error so they don't hang.
+    fn reject_for_state(&self, cmd: ConnectionCmd, state: ActorState) {
+        let err = || {
+            Error::Custom(format!(
+                "connection actor busy ({state:?}); command rejected"
+            ))
+        };
+        match cmd {
+            ConnectionCmd::Ping { reply } => {
+                let _ = reply.send(Err(err()));
+            }
+            ConnectionCmd::ExecuteQuery { reply, .. } => {
+                let _ = reply.send(Err(err()));
+            }
+            ConnectionCmd::BeginInsert { reply, .. } => {
+                let _ = reply.send(Err(err()));
+            }
+            ConnectionCmd::SendInsertBlock { reply, .. } => {
+                let _ = reply.send(Err(err()));
+            }
+            ConnectionCmd::FinishInsert { reply } => {
+                let _ = reply.send(Err(err()));
             }
         }
     }
