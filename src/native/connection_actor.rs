@@ -150,8 +150,23 @@ pub(crate) enum ConnectionCmd {
     /// drain to `EndOfStream`, and return to `Idle` state. After this
     /// the connection is ready for any other command.
     FinishInsert { reply: oneshot::Sender<Result<()>> },
-    // Subsequent variants:
-    //   ExecuteStream { query_id, query, extra_settings, results: mpsc<Result<ServerPacket>> }
+
+    /// Execute a streaming SELECT and forward each `ServerPacket`
+    /// (Data, Progress, ProfileInfo, EndOfStream, Exception) into the
+    /// caller's mpsc until terminal packet.
+    ///
+    /// **Cancel-on-drop:** if the caller drops the receiver mid-stream
+    /// the actor sends [`writer::send_cancel`] to the server, drains
+    /// remaining packets to `EndOfStream`, and returns the connection
+    /// to the pool reusable. This is the streaming cancel-safety win —
+    /// today's cursor leaves the connection in an unknown state on
+    /// drop, forcing pool teardown.
+    ExecuteStream {
+        query_id: String,
+        query: String,
+        extra_settings: Vec<(String, String)>,
+        results: mpsc::Sender<Result<ServerPacket>>,
+    },
 }
 
 /// Internal state machine — what is the actor in the middle of?
@@ -331,6 +346,47 @@ impl ConnectionHandle {
             .map_err(|_| Error::Custom("connection actor closed".into()))?;
         rx.await
             .map_err(|_| Error::Custom("connection actor dropped during FinishInsert".into()))?
+    }
+
+    /// Begin a streaming SELECT. Returns the receive end of an mpsc
+    /// channel that the actor will push every received `ServerPacket`
+    /// into until `EndOfStream` or `Exception`.
+    ///
+    /// **Cancel-on-drop:** drop the returned receiver to abort the
+    /// stream — the actor sends the protocol Cancel packet, drains to
+    /// `EndOfStream`, and the connection stays usable in the pool.
+    /// No need for `drain()` calls or explicit cancellation; it's
+    /// automatic.
+    ///
+    /// `capacity` bounds the in-flight packet buffer. Larger
+    /// capacities = more read-ahead at the cost of memory; the actor's
+    /// reader sub-task will pause when full, providing natural
+    /// backpressure to the server (kernel TCP buffer fills, server
+    /// pauses sending). Production callers typically use 64–256.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if the actor is closed at submit time. Per-
+    /// packet errors (server Exception, I/O failure mid-stream) are
+    /// delivered through the returned receiver.
+    pub(crate) async fn execute_stream(
+        &self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<Result<ServerPacket>>> {
+        let (results, rx) = mpsc::channel(capacity);
+        self.inner
+            .send(ConnectionCmd::ExecuteStream {
+                query_id: query_id.to_owned(),
+                query: query.to_owned(),
+                extra_settings: extra_settings.to_vec(),
+                results,
+            })
+            .await
+            .map_err(|_| Error::Custom("connection actor closed".into()))?;
+        Ok(rx)
     }
 }
 
@@ -538,6 +594,22 @@ impl CommandWorker for ConnectionActor {
                     }
                     self.state = ActorState::Idle;
                     let _ = reply.send(result);
+                }
+                (
+                    ConnectionCmd::ExecuteStream {
+                        query_id,
+                        query,
+                        extra_settings,
+                        results,
+                    },
+                    ActorState::Idle,
+                ) => {
+                    let result = self
+                        .do_execute_stream(&query_id, &query, &extra_settings, results)
+                        .await;
+                    if result.is_err() {
+                        self.poisoned.store(true, Ordering::Release);
+                    }
                 }
                 // Mismatched state — reject without disturbing the actor.
                 (cmd, state) => self.reject_for_state(cmd, state),
@@ -852,6 +924,96 @@ impl ConnectionActor {
         }
     }
 
+    /// Streaming SELECT execution.
+    ///
+    /// Pumps every received `ServerPacket` (Data/Progress/ProfileInfo/
+    /// EndOfStream/Exception) into the caller's mpsc `results` channel.
+    ///
+    /// **Cancel-on-drop semantics:** if `results.send(...).await`
+    /// returns `Err` (caller dropped the receiver), the actor sends
+    /// the protocol Cancel packet and switches to drain mode — it
+    /// keeps reading packets until `EndOfStream` so the connection
+    /// stays clean for the next caller. Connection is NOT poisoned;
+    /// cancellation is treated as a clean termination of this stream.
+    ///
+    /// Returns Ok always for clean cancellation; returns Err only on
+    /// I/O failure that broke the socket (caller-handle() then poisons).
+    async fn do_execute_stream(
+        &mut self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+        results: mpsc::Sender<Result<ServerPacket>>,
+    ) -> Result<()> {
+        let revision = self.server_hello.revision_version;
+        let compression = self.compression;
+        let settings = merge_settings(&self.settings, extra_settings);
+
+        writer::send_query(
+            &mut self.writer,
+            query_id,
+            query,
+            &settings,
+            revision,
+            compression,
+        )
+        .await?;
+        writer::send_empty_block(&mut self.writer, compression).await?;
+
+        let mut cancelled = false;
+
+        loop {
+            // Caller-cancellation check before each blocking recv.
+            // `results.is_closed()` returns true the moment the caller
+            // drops their receiver. send_cancel here is the SQL
+            // protocol Cancel — server will stop streaming.
+            if !cancelled && results.is_closed() {
+                writer::send_cancel(&mut self.writer).await?;
+                cancelled = true;
+            }
+
+            let pkt = match self.recv_packet().await {
+                Ok(p) => p,
+                Err(e) => {
+                    // I/O failed mid-stream. If the caller is still
+                    // listening, surface the error to them.
+                    if !cancelled {
+                        let _ = results.send(Err(e)).await;
+                    }
+                    // Return Err so handle() poisons the connection.
+                    return Err(Error::Custom("stream read failed".into()));
+                }
+            };
+
+            let is_terminal = matches!(pkt, ServerPacket::EndOfStream | ServerPacket::Exception(_));
+
+            if !cancelled {
+                if results.send(Ok(pkt)).await.is_err() {
+                    // Caller just dropped receiver. Issue Cancel and
+                    // continue draining. We DON'T break here — we
+                    // need to consume packets until EndOfStream so
+                    // the socket is clean.
+                    if !cancelled {
+                        // (race-tight check above might have missed
+                        // the close — handle the second-chance path)
+                        if let Err(e) = writer::send_cancel(&mut self.writer).await {
+                            return Err(e);
+                        }
+                        cancelled = true;
+                    }
+                    if is_terminal {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+
+            if is_terminal {
+                return Ok(());
+            }
+        }
+    }
+
     /// Reject a command sent in the wrong state with a clear error.
     /// Caller's reply channel receives the error so they don't hang.
     fn reject_for_state(&self, cmd: ConnectionCmd, state: ActorState) {
@@ -875,6 +1037,11 @@ impl ConnectionActor {
             }
             ConnectionCmd::FinishInsert { reply } => {
                 let _ = reply.send(Err(err()));
+            }
+            ConnectionCmd::ExecuteStream { results, .. } => {
+                // try_send so we don't block if the channel is full;
+                // best-effort surface to the caller.
+                let _ = results.try_send(Err(err()));
             }
         }
     }
