@@ -96,8 +96,26 @@ const DEFAULT_CMD_CHANNEL: usize = 16;
 pub(crate) enum ConnectionCmd {
     /// Send a Ping; reply with `()` when Pong arrives.
     Ping { reply: oneshot::Sender<Result<()>> },
+
+    /// Execute a non-streaming query (DDL, SET, INSERT-without-data,
+    /// or a SELECT whose result rows the caller doesn't want).
+    ///
+    /// Sends Query + empty data block, drains response packets until
+    /// `EndOfStream` or `Exception`.
+    ///
+    /// **Cancellation:** if the caller drops `reply` before the
+    /// response arrives, the actor sends the protocol-level
+    /// [`writer::send_cancel`] packet so the server stops computing,
+    /// then drains to `EndOfStream` so the connection stays reusable.
+    /// This is the cancel-safety win — no pool poisoning, no socket
+    /// teardown, no wasted server CPU.
+    ExecuteQuery {
+        query_id: String,
+        query: String,
+        extra_settings: Vec<(String, String)>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     // Subsequent variants:
-    //   ExecuteQuery { query_id, query, extra_settings, reply: oneshot<Result<()>> }
     //   BeginInsert { query, reply: oneshot<Result<Vec<(String,String)>>> }
     //   SendInsertBlock { column_bytes, num_columns, num_rows, reply: oneshot<Result<()>> }
     //   FinishInsert { reply: oneshot<Result<()>> }
@@ -163,6 +181,42 @@ impl ConnectionHandle {
             .map_err(|_| Error::Custom("connection actor closed".into()))?;
         rx.await
             .map_err(|_| Error::Custom("connection actor dropped during ping".into()))?
+    }
+
+    /// Execute a non-streaming query.
+    ///
+    /// `query_id` is sent verbatim in the query packet header; pass `""`
+    /// to let the server generate its own. `extra_settings` are merged
+    /// over the connection-level settings (per-query overrides).
+    ///
+    /// **Cancellation safety:** if this future is cancelled (caller's
+    /// timeout/select! drops the rx side), the actor sends the
+    /// ClickHouse Cancel packet and drains to `EndOfStream`. The
+    /// connection is **not** poisoned — it's safely returned to the
+    /// pool. This is the foundational cancel-safety win.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor has exited.
+    /// - [`Error::BadResponse`] if the server returns Exception.
+    pub(crate) async fn execute_query(
+        &self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::ExecuteQuery {
+                query_id: query_id.to_owned(),
+                query: query.to_owned(),
+                extra_settings: extra_settings.to_vec(),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Custom("connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("connection actor dropped during query".into()))?
     }
 }
 
@@ -305,6 +359,21 @@ impl CommandWorker for ConnectionActor {
                     }
                     let _ = reply.send(result);
                 }
+                ConnectionCmd::ExecuteQuery {
+                    query_id,
+                    query,
+                    extra_settings,
+                    reply,
+                } => {
+                    let result = self
+                        .do_execute_query(&query_id, &query, &extra_settings, reply)
+                        .await;
+                    if result.is_err() {
+                        // I/O failed (not just a server-side Exception) —
+                        // poison so the pool discards on recycle.
+                        self.poisoned.store(true, Ordering::Release);
+                    }
+                }
             }
         }
     }
@@ -424,6 +493,85 @@ impl ConnectionActor {
         }
     }
 
+    /// Send Query + empty data block, drain response packets until
+    /// `EndOfStream` or `Exception`.
+    ///
+    /// **Cancel-on-drop:** between each `recv_packet` we check whether
+    /// the caller's `reply` oneshot has been dropped (`is_closed()`).
+    /// If so, send the protocol-level Cancel packet, drain remaining
+    /// packets to `EndOfStream`, return Ok — the connection stays in
+    /// the pool, ready for the next caller. The original caller has
+    /// already moved on; we don't try to deliver a result.
+    ///
+    /// Returns `Err` only on an I/O failure that broke the socket
+    /// (caller poisons the connection on Err so the pool discards it).
+    /// Server-side Exception is **not** an I/O failure — it's reported
+    /// through `reply` as `Err(BadResponse)` and we return `Ok(())`.
+    async fn do_execute_query(
+        &mut self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+        reply: oneshot::Sender<Result<()>>,
+    ) -> Result<()> {
+        let revision = self.server_hello.revision_version;
+        let compression = self.compression;
+        let settings = merge_settings(&self.settings, extra_settings);
+
+        // Send the query. If the writer dies here, propagate up so
+        // the caller poisons the connection.
+        writer::send_query(
+            &mut self.writer,
+            query_id,
+            query,
+            &settings,
+            revision,
+            compression,
+        )
+        .await?;
+        writer::send_empty_block(&mut self.writer, compression).await?;
+
+        let mut reply = Some(reply);
+        let mut cancelled = false;
+
+        loop {
+            // Caller-cancellation check before each blocking recv.
+            // `reply.is_closed()` returns true the moment the caller
+            // drops their receiver — that's our signal to send Cancel
+            // and drain.
+            if !cancelled
+                && let Some(r) = reply.as_ref()
+                && r.is_closed()
+            {
+                writer::send_cancel(&mut self.writer).await?;
+                cancelled = true;
+                // Drop the now-useless reply slot.
+                reply = None;
+            }
+
+            let pkt = self.recv_packet().await?;
+            match pkt {
+                ServerPacket::EndOfStream => {
+                    if let Some(r) = reply.take() {
+                        let _ = r.send(Ok(()));
+                    }
+                    return Ok(());
+                }
+                ServerPacket::Exception(err) => {
+                    if let Some(r) = reply.take() {
+                        let _ = r.send(Err(Error::BadResponse(err.to_string())));
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // Discard Data/Progress/ProfileInfo — caller asked
+                    // for execute, not stream.
+                    continue;
+                }
+            }
+        }
+    }
+
     /// Receive the next packet from the reader sub-task. Returns
     /// `Err` if the reader has exited (server EOF / network error).
     async fn recv_packet(&mut self) -> Result<ServerPacket> {
@@ -435,6 +583,24 @@ impl ConnectionActor {
             )),
         }
     }
+}
+
+/// Merge connection-level `base` settings with per-query `extra`,
+/// where `extra` overrides duplicates. Mirrors the helper in
+/// [`crate::native::connection`].
+fn merge_settings(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String, String)> {
+    if extra.is_empty() {
+        return base.to_vec();
+    }
+    let mut merged = base.to_vec();
+    for (k, v) in extra {
+        if let Some(slot) = merged.iter_mut().find(|(ek, _)| ek == k) {
+            slot.1.clone_from(v);
+        } else {
+            merged.push((k.clone(), v.clone()));
+        }
+    }
+    merged
 }
 
 /// Background reader sub-task. Loops on `read_packet` until any error
