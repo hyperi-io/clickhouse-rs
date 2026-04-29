@@ -222,3 +222,15 @@ pub(crate) async fn send_ping<W: ClickHouseWrite>(writer: &mut W) -> Result<()> 
     writer.flush().await?;
     Ok(())
 }
+
+/// Send Cancel packet (no body).
+///
+/// Asks the server to abort the currently-running query and stop streaming
+/// further response packets. The server may still send a few packets that
+/// were already buffered; the caller must continue draining packets until
+/// `EndOfStream` arrives before the connection is reusable.
+pub(crate) async fn send_cancel<W: ClickHouseWrite>(writer: &mut W) -> Result<()> {
+    writer.write_var_uint(ClientPacketId::Cancel as u64).await?;
+    writer.flush().await?;
+    Ok(())
+}

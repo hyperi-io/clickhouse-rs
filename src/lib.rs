@@ -63,6 +63,7 @@ pub mod unified;
 pub mod unified_cursor;
 pub mod unified_insert;
 pub mod unified_query;
+pub mod worker;
 pub use pool_stats::PoolStats;
 pub use unified::{Transport, UnifiedClient};
 
