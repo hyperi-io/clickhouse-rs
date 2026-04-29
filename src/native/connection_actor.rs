@@ -1107,6 +1107,8 @@ async fn reader_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     /// Compile-time sanity: ConnectionActor satisfies CommandWorker.
     /// (The `worker::spawn` call above already enforces this; this test
@@ -1119,8 +1121,148 @@ mod tests {
 
     #[test]
     fn handle_is_clone() {
-        // Compile-time check.
         fn assert_clone<T: Clone>() {}
         assert_clone::<ConnectionHandle>();
+    }
+
+    // ---------------------------------------------------------------
+    // In-process protocol mock — uses a localhost TCP loopback so we
+    // exercise the actual MaybeTlsStream + tokio::io::split + actor
+    // wiring (DuplexStream wouldn't fit MaybeTlsStream's enum).
+    //
+    // The "server" task reads bytes the actor writes and emits
+    // protocol-correct response bytes. Just enough of the wire format
+    // to verify the actor's command dispatch + cancel-on-drop, NOT a
+    // full ClickHouse impl.
+    // ---------------------------------------------------------------
+
+    /// Spawn a paired (actor, server-side TcpStream) for one test.
+    /// The server side is owned by the test; the actor side is wrapped
+    /// in MaybeTlsStream and split, then handed to ConnectionActor.
+    async fn paired() -> (OwnedConnection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = async { listener.accept().await.unwrap().0 };
+        let (client, server) = tokio::join!(connect, accept);
+        let client = client.unwrap();
+        // Disable Nagle so writes flush to the test server immediately.
+        let _ = client.set_nodelay(true);
+        let _ = server.set_nodelay(true);
+
+        let (reader_half, writer_half) = tokio::io::split(MaybeTlsStream::Plain(client));
+
+        // Stub a ServerHello — the actor only reads server_revision
+        // (for protocol version) and that's not used by Ping.
+        let server_hello = ServerHello {
+            revision_version: 54_476, // recent revision; doesn't matter for Ping
+            ..Default::default()
+        };
+
+        let owned = ConnectionActor::spawn_with_keepalive(
+            reader_half,
+            writer_half,
+            server_hello,
+            NativeCompressionMethod::None,
+            vec![],
+            // Long keepalive so it never fires during these tests.
+            Duration::from_secs(3600),
+        );
+        (owned, server)
+    }
+
+    /// Read exactly one byte from the server side.
+    async fn read_byte(server: &mut TcpStream) -> u8 {
+        let mut buf = [0u8; 1];
+        server.read_exact(&mut buf).await.unwrap();
+        buf[0]
+    }
+
+    #[tokio::test]
+    async fn ping_pong_roundtrip() {
+        let (owned, mut server) = paired().await;
+        let handle = owned.handle();
+
+        // Server task: read one Ping byte (varint 4 = single byte 0x04),
+        // then write one Pong byte (varint 4 = single byte 0x04).
+        let server_task = tokio::spawn(async move {
+            let b = read_byte(&mut server).await;
+            assert_eq!(b, 4, "expected client Ping (varint 4)");
+            server.write_all(&[4]).await.unwrap();
+        });
+
+        let result = handle.ping().await;
+        assert!(result.is_ok(), "ping failed: {result:?}");
+        server_task.await.unwrap();
+
+        // Connection still alive after ping — no poison.
+        assert!(handle.is_alive());
+
+        owned.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_sees_actor_dead_after_socket_close() {
+        let (owned, server) = paired().await;
+        let handle = owned.handle();
+
+        // Server-side closes the socket immediately. The actor's reader
+        // sub-task sees EOF, errors propagate, the actor exits, and
+        // its handle reports !is_alive (eventually — there's a small
+        // race where the actor's worker task sees pkt_rx.recv() return
+        // None and exits the loop).
+        drop(server);
+
+        // Try a Ping; expect it to fail (writer either errors mid-send
+        // or the actor exits before responding).
+        let _ = handle.ping().await;
+
+        // Within a short grace period the handle should report dead.
+        for _ in 0..50 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !handle.is_alive(),
+            "handle should report dead after socket close"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_completes_cleanly() {
+        let (owned, _server) = paired().await;
+        // No Ping; just shutdown immediately.
+        let result = owned.shutdown().await;
+        assert!(result.is_ok(), "shutdown failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn drop_aborts_reader_task() {
+        let (owned, server) = paired().await;
+        let handle = owned.handle();
+        // Drop the OwnedConnection — its Drop should abort the reader
+        // sub-task so the socket is released. Server-side detects
+        // close on next read.
+        drop(owned);
+        // server-side read should see EOF eventually.
+        let mut server = server;
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(Duration::from_millis(500), server.read(&mut buf)).await;
+        match result {
+            Ok(Ok(0)) => {} // EOF — expected
+            Ok(Ok(n)) => panic!("expected EOF, got {n} bytes"),
+            Ok(Err(_)) => {} // I/O error — also acceptable
+            Err(_) => panic!("server-side read did not see EOF within 500 ms"),
+        }
+        // Handle should report dead (channel closed because actor exited).
+        for _ in 0..50 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!handle.is_alive());
     }
 }
