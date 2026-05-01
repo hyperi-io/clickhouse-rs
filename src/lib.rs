@@ -15,6 +15,7 @@ use clickhouse_types::{Column, DataTypeNode};
 
 use crate::error::Error;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -52,11 +53,22 @@ mod ticks;
 /// Any `with_*` configuration method (e.g., [`Client::with_setting`]) applies
 /// only to future clones, because [`Client::clone`] creates a deep copy
 /// of the [`Client`] configuration, except the transport.
+///
+/// The round-robin URL counter (`next_url_index`) is shared across clones so
+/// that all copies of a client advance through the same host rotation.
 #[derive(Clone)]
 pub struct Client {
     http: Arc<dyn HttpClient>,
 
-    url: String,
+    /// The ordered list of ClickHouse HTTP endpoints. Always contains at
+    /// least one entry after [`Client::with_url`] or [`Client::with_urls`]
+    /// is called. May be empty for a default-constructed client that has
+    /// not yet had a URL set (preserving backwards compat).
+    urls: Vec<String>,
+    /// Shared counter for round-robin URL selection across all clones.
+    /// `Arc` so all clones advance the same counter; `AtomicUsize` so
+    /// there is no lock contention on the hot path.
+    next_url_index: Arc<AtomicUsize>,
     database: Option<String>,
     authentication: Authentication,
     compression: Compression,
@@ -121,7 +133,8 @@ impl Client {
     pub fn with_http_client(client: impl HttpClient) -> Self {
         Self {
             http: Arc::new(client),
-            url: String::new(),
+            urls: Vec::new(),
+            next_url_index: Arc::new(AtomicUsize::new(0)),
             database: None,
             authentication: Authentication::default(),
             compression: Compression::default(),
@@ -147,19 +160,52 @@ impl Client {
     /// let client = Client::default().with_url("http://localhost:8123");
     /// ```
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
-        self.url = url.into();
+        #[cfg_attr(not(feature = "test-util"), allow(unused_mut))]
+        let mut url = url.into();
 
         // `with_mock()` didn't exist previously, so to not break existing usages,
         // we need to be able to detect a mocked server using nothing but the URL.
         #[cfg(feature = "test-util")]
-        if let Some(url) = test::Mock::mocked_url_to_real(&self.url) {
-            self.url = url;
+        if let Some(real_url) = test::Mock::mocked_url_to_real(&url) {
+            url = real_url;
             self.mocked = true;
         }
+
+        self.urls = vec![url];
 
         // Assume our cached metadata is invalid.
         self.insert_metadata_cache = Default::default();
 
+        self
+    }
+
+    /// Specifies multiple ClickHouse HTTP endpoints for round-robin failover.
+    ///
+    /// On each request the client picks the next URL from the list using a
+    /// shared atomic counter, cycling through the hosts in order. All clones
+    /// share the counter, so concurrent users of the same `Client` advance
+    /// through the rotation together.
+    ///
+    /// Automatically [clears the metadata cache][Self::clear_cached_metadata]
+    /// for this instance only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `urls` is empty -- a client must have at least one endpoint
+    /// to be useful.
+    ///
+    /// # Examples
+    /// ```
+    /// # use clickhouse::Client;
+    /// let client = Client::default().with_urls(vec![
+    ///     "http://ch-1:8123".to_string(),
+    ///     "http://ch-2:8123".to_string(),
+    /// ]);
+    /// ```
+    pub fn with_urls(mut self, urls: Vec<String>) -> Self {
+        assert!(!urls.is_empty(), "with_urls: URL list must not be empty");
+        self.urls = urls;
+        self.insert_metadata_cache = Default::default();
         self
     }
 
@@ -595,9 +641,32 @@ impl Client {
     /// which is pointless in that kind of tests.
     #[cfg(feature = "test-util")]
     pub fn with_mock(mut self, mock: &test::Mock) -> Self {
-        self.url = mock.real_url().to_string();
+        self.urls = vec![mock.real_url().to_string()];
         self.mocked = true;
         self
+    }
+
+    /// Pick the next URL from the round-robin list.
+    ///
+    /// Single-URL clients skip the atomic increment entirely (no
+    /// unnecessary write on the hot path). With multiple URLs the
+    /// shared counter advances by one each call, modulo the list
+    /// length, cycling through hosts in insertion order.
+    ///
+    /// # Panics
+    ///
+    /// Returns the empty string for default-constructed clients that
+    /// have not yet had a URL set, preserving the original behaviour
+    /// of the previous `url: String` field.
+    pub(crate) fn pick_url(&self) -> &str {
+        match self.urls.len() {
+            0 => "",
+            1 => &self.urls[0],
+            n => {
+                let idx = self.next_url_index.fetch_add(1, Ordering::Relaxed);
+                &self.urls[idx % n]
+            }
+        }
     }
 
     async fn get_insert_metadata(&self, raw_table_name: &str) -> Result<Arc<InsertMetadata>> {
@@ -909,5 +978,54 @@ mod client_tests {
 
         assert_eq!(client.set_setting("foo", "foo_2"), Some("foo".to_string()));
         assert_eq!(client.set_setting("bar", "bar_2"), Some("bar".to_string()));
+    }
+
+    #[test]
+    fn pick_url_default_returns_empty() {
+        let client = Client::default();
+        assert_eq!(client.pick_url(), "");
+    }
+
+    #[test]
+    fn pick_url_single_url_does_not_advance_counter() {
+        let client = Client::default().with_url("http://localhost:8123");
+        assert_eq!(client.pick_url(), "http://localhost:8123");
+        assert_eq!(client.pick_url(), "http://localhost:8123");
+        // Single-URL clients skip the atomic increment entirely.
+        assert_eq!(
+            client.next_url_index.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn with_urls_round_robins() {
+        let client = Client::default().with_urls(vec![
+            "http://a:8123".to_string(),
+            "http://b:8123".to_string(),
+            "http://c:8123".to_string(),
+        ]);
+        assert_eq!(client.pick_url(), "http://a:8123");
+        assert_eq!(client.pick_url(), "http://b:8123");
+        assert_eq!(client.pick_url(), "http://c:8123");
+        assert_eq!(client.pick_url(), "http://a:8123");
+    }
+
+    #[test]
+    fn with_urls_clones_share_counter() {
+        let client_a = Client::default().with_urls(vec![
+            "http://a:8123".to_string(),
+            "http://b:8123".to_string(),
+        ]);
+        let client_b = client_a.clone();
+        // Each client picks once; the shared counter advances twice.
+        assert_eq!(client_a.pick_url(), "http://a:8123");
+        assert_eq!(client_b.pick_url(), "http://b:8123");
+    }
+
+    #[test]
+    #[should_panic(expected = "with_urls: URL list must not be empty")]
+    fn with_urls_panics_on_empty() {
+        let _ = Client::default().with_urls(vec![]);
     }
 }

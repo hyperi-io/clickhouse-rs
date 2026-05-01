@@ -445,7 +445,8 @@ impl InsertFormatted {
 
         tracing::trace!("beginning insert");
 
-        let mut url = Url::parse(&client.url).map_err(|err| Error::InvalidParams(err.into()))?;
+        let mut url =
+            Url::parse(client.pick_url()).map_err(|err| Error::InvalidParams(err.into()))?;
         let mut pairs = url.query_pairs_mut();
         pairs.clear();
 
