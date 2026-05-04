@@ -113,6 +113,97 @@ async fn handle_clones_can_write_concurrently() {
 }
 
 #[tokio::test]
+async fn multi_table_write_to_routes_per_table() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let rec_a = mock.add(test::handlers::record::<SimpleRow>());
+    let rec_b = mock.add(test::handlers::record::<SimpleRow>());
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new_multi_table(
+        &client,
+        AsyncInserterConfig::default().without_period(),
+    );
+
+    // Mock handlers are matched in registration order; mock.add() FIFO
+    // matches each handler to one HTTP request. Two tables -> two
+    // separate INSERT requests.
+    inserter.write_to("table_a", SimpleRow::new(1, "a")).await.unwrap();
+    inserter.write_to("table_b", SimpleRow::new(2, "b")).await.unwrap();
+
+    let _q = inserter.end().await.unwrap();
+
+    let rows_a: Vec<SimpleRow> = rec_a.collect().await;
+    let rows_b: Vec<SimpleRow> = rec_b.collect().await;
+    assert_eq!(rows_a, vec![SimpleRow::new(1, "a")]);
+    assert_eq!(rows_b, vec![SimpleRow::new(2, "b")]);
+}
+
+#[tokio::test]
+async fn multi_table_write_default_is_rejected() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new_multi_table(
+        &client,
+        AsyncInserterConfig::default().without_period(),
+    );
+
+    // No default table -> write() must error.
+    let result = inserter.write(SimpleRow::new(1, "a")).await;
+    assert!(result.is_err(), "expected error from write() in multi-table mode");
+
+    let _ = inserter.end().await;
+}
+
+#[tokio::test]
+async fn multi_table_flush_aggregates_quantities() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let _rec_a = mock.add(test::handlers::record::<SimpleRow>());
+    let _rec_b = mock.add(test::handlers::record::<SimpleRow>());
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new_multi_table(
+        &client,
+        AsyncInserterConfig::default().without_period(),
+    );
+
+    inserter.write_to("table_a", SimpleRow::new(1, "a")).await.unwrap();
+    inserter.write_to("table_b", SimpleRow::new(2, "b")).await.unwrap();
+
+    let q = inserter.flush().await.unwrap();
+    // Two rows total across both tables; the worker sums quantities.
+    assert_eq!(q.rows, 2);
+
+    let _ = inserter.end().await;
+}
+
+#[tokio::test]
+async fn single_table_write_to_other_table_works() {
+    // The single-table API still supports `write_to` for ad-hoc
+    // routing (the worker just creates an additional buffer).
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let rec_default = mock.add(test::handlers::record::<SimpleRow>());
+    let rec_other = mock.add(test::handlers::record::<SimpleRow>());
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new(
+        &client,
+        "default_table",
+        AsyncInserterConfig::default().without_period(),
+    );
+
+    inserter.write(SimpleRow::new(1, "default")).await.unwrap();
+    inserter.write_to("other_table", SimpleRow::new(2, "other")).await.unwrap();
+
+    let _ = inserter.end().await;
+
+    let rows_default: Vec<SimpleRow> = rec_default.collect().await;
+    let rows_other: Vec<SimpleRow> = rec_other.collect().await;
+    assert_eq!(rows_default, vec![SimpleRow::new(1, "default")]);
+    assert_eq!(rows_other, vec![SimpleRow::new(2, "other")]);
+}
+
+#[tokio::test]
 async fn period_flush_fires_when_quiet() {
     tokio::time::pause();
 

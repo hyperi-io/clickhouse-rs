@@ -23,6 +23,8 @@
 //! # Ok(()) }
 //! ```
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::oneshot;
@@ -105,8 +107,16 @@ impl AsyncInserterConfig {
 /// Internal command enum; not part of the public API.
 #[doc(hidden)]
 pub enum AsyncInserterCommand<T> {
+    /// Write to the worker's preset default table (single-table mode only;
+    /// errors with [`Error::Custom`] in multi-table mode).
     Write(T, oneshot::Sender<Result<()>>),
+    /// Write to an explicit table (multi-table API). Lazily creates an
+    /// internal [`Inserter<T>`] for the table on first use.
+    WriteTo(String, T, oneshot::Sender<Result<()>>),
+    /// Force-flush every per-table buffer; returns the summed [`Quantities`].
     Flush(oneshot::Sender<Result<Quantities>>),
+    /// End every per-table buffer; returns the summed [`Quantities`] from
+    /// the final commits.
     End(oneshot::Sender<Result<Quantities>>),
 }
 
@@ -115,12 +125,37 @@ pub enum AsyncInserterCommand<T> {
 // ---------------------------------------------------------------------------
 
 struct InserterWorker<T> {
-    /// `Option` so `End` / `on_shutdown` can `take` for the consuming
-    /// `Inserter::end()`. Once `None`, subsequent commands are no-ops.
-    inserter: Option<Inserter<T>>,
-    /// Held so `idle_interval` can read the period; `Inserter<T>`
-    /// stores its own copy but doesn't expose it.
+    /// Used by `get_or_create` for lazy per-table construction.
+    client: Client,
     config: AsyncInserterConfig,
+    /// `Some` for single-table mode (routes `Write` commands here);
+    /// `None` for multi-table (rejects `Write`, accepts `WriteTo`).
+    /// `Arc<str>` so the per-`Write` clone is a refcount bump.
+    default_table: Option<Arc<str>>,
+    /// Eager entry for single-table; lazy insert on first `WriteTo`.
+    inserters: HashMap<String, Inserter<T>>,
+    /// Set after `End`. Subsequent commands return safe defaults.
+    ended: bool,
+}
+
+impl<T> InserterWorker<T>
+where
+    T: RowOwned + RowWrite + Send + Sync + 'static,
+{
+    /// Get-or-create the inserter for `table`. Uses `HashMap::entry`
+    /// for a single lookup on the hot path. New inserters inherit the
+    /// worker's threshold config.
+    fn get_or_create(&mut self, table: &str) -> &mut Inserter<T> {
+        self.inserters
+            .entry(table.to_string())
+            .or_insert_with(|| {
+                self.client
+                    .inserter::<T>(table)
+                    .with_max_rows(self.config.max_rows)
+                    .with_max_bytes(self.config.max_bytes)
+                    .with_period(self.config.max_period)
+            })
+    }
 }
 
 impl<T> CommandWorker for InserterWorker<T>
@@ -138,62 +173,105 @@ where
     }
 
     async fn handle(&mut self, cmd: Self::Command) {
-        let Some(inserter) = self.inserter.as_mut() else {
-            // Already ended; subsequent commands no-op or report closed.
+        if self.ended {
+            // Post-End: inserters consumed; reply with safe defaults so
+            // callers don't hang while we wait for shutdown.
             match cmd {
-                AsyncInserterCommand::Write(_, resp) => {
+                AsyncInserterCommand::Write(_, resp) | AsyncInserterCommand::WriteTo(_, _, resp) => {
                     let _ = resp.send(Err(channel_closed_err()));
                 }
-                AsyncInserterCommand::Flush(resp) => {
-                    let _ = resp.send(Ok(Quantities::ZERO));
-                }
-                AsyncInserterCommand::End(resp) => {
+                AsyncInserterCommand::Flush(resp) | AsyncInserterCommand::End(resp) => {
                     let _ = resp.send(Ok(Quantities::ZERO));
                 }
             }
             return;
-        };
+        }
 
         match cmd {
             AsyncInserterCommand::Write(row, resp) => {
+                let Some(table) = self.default_table.clone() else {
+                    let _ = resp.send(Err(Error::Custom(
+                        "AsyncInserter::write called on a multi-table inserter; \
+                         use write_to(table, row) instead"
+                            .into(),
+                    )));
+                    return;
+                };
+                let inserter = self.get_or_create(table.as_ref());
                 let result = inserter.write(&row).await;
                 if result.is_ok() {
-                    // commit() runs the threshold check; no-op if untripped.
+                    let _ = inserter.commit().await;
+                }
+                let _ = resp.send(result);
+            }
+            AsyncInserterCommand::WriteTo(table, row, resp) => {
+                let inserter = self.get_or_create(&table);
+                let result = inserter.write(&row).await;
+                if result.is_ok() {
                     let _ = inserter.commit().await;
                 }
                 let _ = resp.send(result);
             }
             AsyncInserterCommand::Flush(resp) => {
-                let _ = resp.send(inserter.force_commit().await);
+                let mut total = Quantities::ZERO;
+                let mut last_err: Option<Error> = None;
+                for inserter in self.inserters.values_mut() {
+                    match inserter.force_commit().await {
+                        Ok(q) => {
+                            total.bytes = total.bytes.saturating_add(q.bytes);
+                            total.rows = total.rows.saturating_add(q.rows);
+                            total.transactions =
+                                total.transactions.saturating_add(q.transactions);
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                let _ = resp.send(last_err.map_or(Ok(total), Err));
             }
             AsyncInserterCommand::End(resp) => {
-                // Take out the inserter so the consuming end() can run.
-                // After this, self.inserter is None and the worker is
-                // effectively done; the runner will exit when shutdown
-                // is signalled.
-                // The runner serialises commands and the `End` arm is the
-                // last one to run before shutdown, so `self.inserter` is
-                // always `Some` here. The runner exits after this match
-                // anyway; the second `End` would be a programmer error.
-                let Some(inserter) = self.inserter.take() else {
-                    unreachable!("End reached after the inserter was already consumed");
-                };
-                let _ = resp.send(inserter.end().await);
+                let mut total = Quantities::ZERO;
+                let mut last_err: Option<Error> = None;
+                // `drain` consumes each inserter so the consuming
+                // `Inserter::end()` can run.
+                let entries: Vec<(String, Inserter<T>)> = self.inserters.drain().collect();
+                for (_, inserter) in entries {
+                    match inserter.end().await {
+                        Ok(q) => {
+                            total.bytes = total.bytes.saturating_add(q.bytes);
+                            total.rows = total.rows.saturating_add(q.rows);
+                            total.transactions =
+                                total.transactions.saturating_add(q.transactions);
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                self.ended = true;
+                let _ = resp.send(last_err.map_or(Ok(total), Err));
             }
         }
     }
 
     async fn on_idle(&mut self) {
-        if let Some(inserter) = self.inserter.as_mut() {
-            // commit() runs the threshold check; idle on a quiet worker is a no-op.
+        if self.ended {
+            return;
+        }
+        // commit() runs the threshold check; idle on a quiet worker is a no-op.
+        for inserter in self.inserters.values_mut() {
             let _ = inserter.commit().await;
         }
     }
 
     async fn on_shutdown(&mut self) {
-        if let Some(inserter) = self.inserter.take() {
+        if self.ended {
+            return;
+        }
+        // Worker's final cleanup: drain each inserter; errors dropped
+        // (no caller to receive them).
+        let entries: Vec<(String, Inserter<T>)> = self.inserters.drain().collect();
+        for (_, inserter) in entries {
             let _ = inserter.end().await;
         }
+        self.ended = true;
     }
 }
 
@@ -247,19 +325,47 @@ impl<T> AsyncInserter<T>
 where
     T: RowOwned + RowWrite + Send + Sync + 'static,
 {
-    /// Create an `AsyncInserter` for `table`. Spawns the background
-    /// task immediately.
+    /// Single-table `AsyncInserter` for `table`. Spawns the background
+    /// task immediately. [`write`][Self::write] routes to `table`;
+    /// [`write_to`][Self::write_to] still works with other tables (a
+    /// per-table buffer is created on first use).
     pub fn new(client: &Client, table: &str, config: AsyncInserterConfig) -> Self {
-        let inserter = client
-            .inserter::<T>(table)
-            .with_max_rows(config.max_rows)
-            .with_max_bytes(config.max_bytes)
-            .with_period(config.max_period);
+        Self::spawn_inner(client, Some(Arc::from(table)), config)
+    }
+
+    /// Multi-table `AsyncInserter`. No default table; callers must use
+    /// [`write_to`][Self::write_to]. Per-table buffers share thresholds
+    /// and a single background task (one period tick coordinates
+    /// flushes across all tables). [`write`][Self::write] returns an
+    /// error in this mode.
+    pub fn new_multi_table(client: &Client, config: AsyncInserterConfig) -> Self {
+        Self::spawn_inner(client, None, config)
+    }
+
+    fn spawn_inner(
+        client: &Client,
+        default_table: Option<Arc<str>>,
+        config: AsyncInserterConfig,
+    ) -> Self {
+        let mut inserters: HashMap<String, Inserter<T>> = HashMap::new();
+        if let Some(table) = default_table.as_ref() {
+            // Eager construction for single-table mode (inserter ready
+            // before any write).
+            let inserter = client
+                .inserter::<T>(table.as_ref())
+                .with_max_rows(config.max_rows)
+                .with_max_bytes(config.max_bytes)
+                .with_period(config.max_period);
+            inserters.insert(table.as_ref().to_string(), inserter);
+        }
 
         let channel_capacity = config.channel_capacity;
         let worker = InserterWorker {
-            inserter: Some(inserter),
-            config,
+            client: client.clone(),
+            config: config.clone(),
+            default_table,
+            inserters,
+            ended: false,
         };
 
         let control = worker::spawn(worker, channel_capacity);
@@ -289,8 +395,34 @@ where
         resp_rx.await.map_err(|_| channel_closed_err())?
     }
 
-    /// Force-flush buffered rows, returning committed [`Quantities`].
-    /// Empty buffer = zero.
+    /// Serialise + buffer a row for `table`. Creates a per-table
+    /// buffer on first sight. Works in single-table or multi-table
+    /// mode (fan-in across schema-compatible tables).
+    pub async fn write_to(&self, table: &str, row: T) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.handle
+            .send(AsyncInserterCommand::WriteTo(
+                table.to_string(),
+                row,
+                resp_tx,
+            ))
+            .await
+            .map_err(|_: SendError<_>| channel_closed_err())?;
+        resp_rx.await.map_err(|_| channel_closed_err())?
+    }
+
+    /// Force-flush every per-table buffer; returns summed
+    /// [`Quantities`] (zero per empty buffer).
+    ///
+    /// # Failure semantics (this layer)
+    ///
+    /// Best-effort multi-table: every per-table flush is attempted,
+    /// `Quantities` sums successes, the last error is surfaced.
+    /// Tables flushed before a failure have already committed.
+    /// Layer 04-failure-semantics tightens this to all-or-nothing
+    /// (architecture.md sections 11.1 P4 and 11.2). At-least-once
+    /// replay needs server-side dedup
+    /// (`insert_deduplicate=1` on non-replicated tables).
     pub async fn flush(&self) -> Result<Quantities> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.handle
@@ -341,7 +473,23 @@ where
         resp_rx.await.map_err(|_| channel_closed_err())?
     }
 
-    /// Same as [`AsyncInserter::flush`].
+    /// Serialise and buffer a row to `table` (same semantics as
+    /// [`AsyncInserter::write_to`]).
+    pub async fn write_to(&self, table: &str, row: T) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.handle
+            .send(AsyncInserterCommand::WriteTo(
+                table.to_string(),
+                row,
+                resp_tx,
+            ))
+            .await
+            .map_err(|_: SendError<_>| channel_closed_err())?;
+        resp_rx.await.map_err(|_| channel_closed_err())?
+    }
+
+    /// Force-flush all buffered rows across all tables (same semantics
+    /// as [`AsyncInserter::flush`]).
     pub async fn flush(&self) -> Result<Quantities> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.handle
