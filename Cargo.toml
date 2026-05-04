@@ -138,7 +138,7 @@ serde_json = "1"
 
 thiserror = "2.0"
 bytes = { version = "1.5.0", features = ["serde"] }
-tokio = { version = "1.0.1", features = ["rt", "macros"] }
+tokio = { version = "1.0.1", features = ["rt", "macros", "io-util", "sync"] }
 http-body-util = "0.1.2"
 hyper = "1.4"
 hyper-util = { version = "0.1.6", features = ["client-legacy", "http1"] }
