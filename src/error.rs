@@ -37,6 +37,11 @@ pub enum Error {
     VariantDiscriminatorIsOutOfBound(usize),
     #[error("a custom error message from serde: {0}")]
     Custom(String),
+    /// Background worker task exited; the inserter is no longer
+    /// accepting commands. Terminal: construct a fresh inserter,
+    /// don't retry the same handle.
+    #[error("background worker task has exited; the inserter is no longer accepting commands")]
+    WorkerExited,
     #[error("bad response: {0}")]
     BadResponse(String),
     #[error("timeout expired")]
@@ -129,6 +134,7 @@ impl Error {
             Error::InvalidTagEncoding(_) => "InvalidTagEncoding",
             Error::VariantDiscriminatorIsOutOfBound(_) => "VariantDiscriminatorIsOutOfBound",
             Error::Custom(_) => "Custom",
+            Error::WorkerExited => "WorkerExited",
             Error::BadResponse(_) => "BadResponse",
             Error::TimedOut => "TimedOut",
             Error::InvalidColumnsHeader(_) => "InvalidColumnsHeader",

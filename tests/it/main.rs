@@ -249,6 +249,7 @@ pub(crate) mod decimals {
 mod chrono;
 mod cloud_jwt;
 mod compression;
+mod async_inserter;
 mod cursor_error;
 mod cursor_stats;
 mod fetch_bytes;
