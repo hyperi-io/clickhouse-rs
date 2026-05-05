@@ -56,7 +56,7 @@ async fn block_envelope_has_block_info_then_counts() {
 
     let mut insert: InsertNative<Tiny> =
         InsertNative::with_columns(&client, "tiny", &columns()).unwrap();
-    insert.write(&Tiny { id: 1, name: "a".into() }).unwrap();
+    insert.write(&Tiny { id: 1, name: "a".into() }).await.unwrap();
     insert.end().await.unwrap();
 
     let body = recorder.body().await;
@@ -91,8 +91,8 @@ async fn integer_column_serialises_le() {
 
     let mut insert: InsertNative<OneU32> =
         InsertNative::with_columns(&client, "t", &cols).unwrap();
-    insert.write(&OneU32 { x: 0x01020304 }).unwrap();
-    insert.write(&OneU32 { x: 0x05060708 }).unwrap();
+    insert.write(&OneU32 { x: 0x01020304 }).await.unwrap();
+    insert.write(&OneU32 { x: 0x05060708 }).await.unwrap();
     insert.end().await.unwrap();
 
     let body = recorder.body().await;
@@ -107,6 +107,94 @@ async fn integer_column_serialises_le() {
     assert_eq!(column_data.len(), 8, "two u32 = 8 bytes");
     assert_eq!(&column_data[0..4], &0x01020304u32.to_le_bytes());
     assert_eq!(&column_data[4..8], &0x05060708u32.to_le_bytes());
+}
+
+#[tokio::test]
+async fn chunks_at_max_rows_per_block() {
+    // Three rows with a 2-row threshold should produce 2 blocks:
+    //   block #1: 2 rows (auto-flushed on 2nd write)
+    //   block #2: 1 row (flushed by end())
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_raw_body());
+
+    #[derive(Row, Serialize)]
+    struct OneU32 {
+        x: u32,
+    }
+    let cols = vec![("x".to_string(), "UInt32".to_string())];
+
+    let mut insert: InsertNative<OneU32> =
+        InsertNative::with_columns(&client, "t", &cols)
+            .unwrap()
+            .with_max_rows_per_block(2);
+
+    insert.write(&OneU32 { x: 1 }).await.unwrap();
+    insert.write(&OneU32 { x: 2 }).await.unwrap(); // triggers flush
+    insert.write(&OneU32 { x: 3 }).await.unwrap();
+    insert.end().await.unwrap();
+
+    let body = recorder.body().await;
+
+    // Block envelope is BlockInfo (8 bytes) + varint counts + column data.
+    // Find the second BlockInfo header after position 0.
+    let block_info: &[u8] = &[0x01, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+    assert!(
+        body.starts_with(block_info),
+        "first block must start with BlockInfo header"
+    );
+    // Locate the second BlockInfo by searching for the same byte pattern
+    // anywhere after the first block envelope.
+    let mut count = 0;
+    let mut i = 0;
+    while i + block_info.len() <= body.len() {
+        if &body[i..i + block_info.len()] == block_info {
+            count += 1;
+            i += block_info.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert_eq!(count, 2, "expected exactly two block envelopes; got {count}");
+}
+
+#[tokio::test]
+async fn flush_emits_block_immediately() {
+    // Explicit `flush()` between writes should produce two blocks
+    // even without hitting any threshold.
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_raw_body());
+
+    #[derive(Row, Serialize)]
+    struct OneU32 {
+        x: u32,
+    }
+    let cols = vec![("x".to_string(), "UInt32".to_string())];
+
+    let mut insert: InsertNative<OneU32> =
+        InsertNative::with_columns(&client, "t", &cols)
+            .unwrap()
+            .with_max_rows_per_block(u64::MAX);
+
+    insert.write(&OneU32 { x: 100 }).await.unwrap();
+    insert.flush().await.unwrap();
+    insert.write(&OneU32 { x: 200 }).await.unwrap();
+    insert.end().await.unwrap();
+
+    let body = recorder.body().await;
+    let block_info: &[u8] = &[0x01, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+    let mut count = 0;
+    let mut i = 0;
+    while i + block_info.len() <= body.len() {
+        if &body[i..i + block_info.len()] == block_info {
+            count += 1;
+            i += block_info.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert_eq!(count, 2, "expected two block envelopes");
 }
 
 #[tokio::test]
