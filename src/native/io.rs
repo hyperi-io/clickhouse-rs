@@ -155,7 +155,7 @@ impl<T: bytes::Buf> ClickHouseBytesRead for T {
 }
 
 /// Sync extension trait on `bytes::BufMut` for ClickHouse wire protocol.
-pub(crate) trait ClickHouseBytesWrite: bytes::BufMut {
+pub trait ClickHouseBytesWrite: bytes::BufMut {
     fn put_var_uint(&mut self, value: u64);
     fn put_string<V: AsRef<[u8]>>(&mut self, value: V);
 }

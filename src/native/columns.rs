@@ -14,7 +14,7 @@ use crate::native::io::ClickHouseRead;
 
 /// Supported ClickHouse column types for native transport.
 #[derive(Debug, Clone)]
-pub(crate) enum ColumnType {
+pub enum ColumnType {
     UInt8,
     UInt16,
     UInt32,

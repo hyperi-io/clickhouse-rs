@@ -173,3 +173,41 @@ impl RecordDdlControl {
 pub fn record_ddl() -> impl Handler<Control = RecordDdlControl> {
     RecordDdlHandler
 }
+
+// === record_raw_body ===
+
+struct RecordRawBodyHandler;
+
+impl super::sealed::Sealed for RecordRawBodyHandler {}
+
+impl super::Handler for RecordRawBodyHandler {
+    type Control = RecordRawBodyControl;
+
+    #[doc(hidden)]
+    fn make(self) -> (HandlerFn, Self::Control) {
+        let (tx, rx) = oneshot::channel();
+        let control = RecordRawBodyControl(rx);
+
+        let h = Box::new(move |request: Request<Bytes>| -> Response<Bytes> {
+            let body = request.into_body();
+            let _ = tx.send(body);
+            Response::new(<_>::default())
+        });
+
+        (h, control)
+    }
+}
+
+/// Captures the request body as raw [`Bytes`]. Used for binary-format
+/// tests (e.g. `Format::Native`) where the body is not UTF-8.
+pub struct RecordRawBodyControl(oneshot::Receiver<Bytes>);
+
+impl RecordRawBodyControl {
+    pub async fn body(self) -> Bytes {
+        self.0.await.expect("request canceled")
+    }
+}
+
+pub fn record_raw_body() -> impl Handler<Control = RecordRawBodyControl> {
+    RecordRawBodyHandler
+}

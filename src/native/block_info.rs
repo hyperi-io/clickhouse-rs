@@ -10,7 +10,7 @@ use crate::native::io::{ClickHouseRead, ClickHouseWrite};
 
 /// Metadata about a native protocol data block.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockInfo {
+pub struct BlockInfo {
     pub(crate) is_overflows: bool,
     pub(crate) bucket_num: i32,
 }
@@ -56,6 +56,18 @@ impl BlockInfo {
         writer.write_i32_le(self.bucket_num).await?;
         writer.write_var_uint(0).await?;
         Ok(())
+    }
+
+    /// Synchronously emit the block-info bytes to a `BufMut`-style sink.
+    /// Useful for the HTTP path (layer 05c) which composes a Native
+    /// request body in memory before sending.
+    pub fn write_to_buf<B: bytes::BufMut>(&self, buf: &mut B) {
+        use crate::native::io::ClickHouseBytesWrite;
+        buf.put_var_uint(1);
+        buf.put_u8(if self.is_overflows { 1 } else { 0 });
+        buf.put_var_uint(2);
+        buf.put_i32_le(self.bucket_num);
+        buf.put_var_uint(0);
     }
 }
 

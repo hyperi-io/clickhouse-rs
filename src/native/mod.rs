@@ -55,10 +55,16 @@
 // the lint.
 #![allow(dead_code)]
 
-pub(crate) mod block_info;
-pub(crate) mod columns;
+pub mod block_info;
+pub mod columns;
 #[cfg(feature = "lz4")]
-pub(crate) mod compression;
-pub(crate) mod encode;
-pub(crate) mod io;
-pub(crate) mod sparse;
+pub mod compression;
+pub mod encode;
+pub mod io;
+pub mod sparse;
+
+// Convenience re-exports for the layer-05c HTTP path. Users composing
+// `format=Native` request bodies typically need these together.
+pub use block_info::BlockInfo;
+pub use columns::ColumnType;
+pub use encode::{ColumnSchema, encode_columns};
