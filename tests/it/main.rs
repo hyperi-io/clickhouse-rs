@@ -250,6 +250,8 @@ mod chrono;
 mod cloud_jwt;
 mod compression;
 mod async_inserter;
+mod batch_isolation;
+mod batch_isolation_live;
 mod cursor_error;
 mod cursor_stats;
 mod fetch_bytes;
