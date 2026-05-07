@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 pub mod async_inserter;
 pub mod batch_isolation;
 pub mod error;
+pub mod recovery;
 pub mod insert;
 pub mod insert_formatted;
 #[cfg(feature = "inserter")]

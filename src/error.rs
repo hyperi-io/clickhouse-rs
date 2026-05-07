@@ -118,6 +118,14 @@ impl From<io::Error> for Error {
 }
 
 impl Error {
+    /// Method sugar over
+    /// [`recovery::failing_row_from_error`][crate::recovery::failing_row_from_error].
+    /// See [`recovery`][crate::recovery] for parsed patterns.
+    #[must_use]
+    pub fn failing_row(&self) -> Option<crate::recovery::FailureLocation> {
+        crate::recovery::failing_row_from_error(self)
+    }
+
     /// https://opentelemetry.io/docs/specs/semconv/registry/attributes/error/#error-type
     #[cfg(feature = "opentelemetry")]
     pub(crate) fn error_type(&self) -> &str {
