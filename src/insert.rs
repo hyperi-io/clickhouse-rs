@@ -193,7 +193,13 @@ impl<T> Insert<T> {
         }
     }
 
-    /// Returns the number of bytes written, not including the RBWNAT header.
+    /// Bytes written (excl. RBWNAT header).
+    ///
+    /// # Failure semantics
+    ///
+    /// Serialise error truncates this row's bytes; the buffer keeps
+    /// earlier successful rows. Transport errors still abort, but
+    /// those happen at flush, not here.
     #[inline(always)]
     pub(crate) fn do_write(&mut self, row: &T::Value<'_>) -> Result<usize>
     where
@@ -213,12 +219,14 @@ impl<T> Insert<T> {
         };
         let written = buffer.len() - old_buf_size;
 
-        if let Err(e) = &result {
+        if let Err(e) = result {
             e.record_in_current_span("error serializing row");
-            self.abort();
+            // Roll back this row's bytes; keep earlier rows.
+            buffer.truncate(old_buf_size);
+            return Err(e);
         }
 
-        result.and(Ok(written))
+        Ok(written)
     }
 
     /// Ends `INSERT`, the server starts processing the data.
