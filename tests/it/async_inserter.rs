@@ -235,3 +235,82 @@ async fn period_flush_fires_when_quiet() {
     // recorder above.
     let _ = inserter.end().await;
 }
+
+// ---------------------------------------------------------------------------
+// Failure semantics (architecture.md section 11)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn multi_table_flush_first_error_aborts_atomically() {
+    // Two tables: table_a's INSERT succeeds, table_b's returns 500.
+    // The flush() must return Err -- caller learns the batch did not
+    // fully land. Per architecture.md section 11.4 the rows for table_a may
+    // already be in CH; replay safety relies on server-side dedup.
+    use hyper::StatusCode;
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    // Mock handlers are matched FIFO. The order of HTTP requests
+    // depends on `HashMap` iteration; we register both record + a
+    // failure so whichever fires first records and whichever fires
+    // second gets 500. Either way the flush observes one success +
+    // one failure.
+    let _rec_a = mock.add(test::handlers::record::<SimpleRow>());
+    let _ = mock.add(test::handlers::failure(StatusCode::INTERNAL_SERVER_ERROR));
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new_multi_table(
+        &client,
+        AsyncInserterConfig::default().without_period(),
+    );
+
+    inserter
+        .write_to("table_a", SimpleRow::new(1, "a"))
+        .await
+        .unwrap();
+    inserter
+        .write_to("table_b", SimpleRow::new(2, "b"))
+        .await
+        .unwrap();
+
+    let result = inserter.flush().await;
+    assert!(
+        result.is_err(),
+        "flush should fail atomically when any table's INSERT errors"
+    );
+
+    let _ = inserter.end().await;
+}
+
+#[tokio::test]
+async fn auto_commit_error_propagates_to_write_caller() {
+    // When a single-table insert exercises a max_rows threshold of 1,
+    // every write triggers an auto-commit. If that auto-commit fails
+    // the write's caller must see the error -- previously the result
+    // was silently swallowed.
+    use hyper::StatusCode;
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let _ = mock.add(test::handlers::failure(StatusCode::INTERNAL_SERVER_ERROR));
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new(
+        &client,
+        "tiny",
+        AsyncInserterConfig::default()
+            .without_period()
+            .with_max_rows(1)
+            .with_max_bytes(u64::MAX),
+    );
+
+    // The single write triggers commit() (max_rows=1 reached), and
+    // that commit hits the 500 mock -- the caller's write() must
+    // surface the error.
+    let result = inserter.write(SimpleRow::new(1, "boom")).await;
+    assert!(
+        result.is_err(),
+        "auto-commit failure during write must propagate to caller"
+    );
+
+    // Drop without expecting end() success: the worker is still alive
+    // but its inner Insert<T> was aborted; subsequent commands behave
+    // sanely.
+    let _ = inserter.end().await;
+}

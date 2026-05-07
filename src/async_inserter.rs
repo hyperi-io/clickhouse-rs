@@ -156,6 +156,17 @@ where
                     .with_period(self.config.max_period)
             })
     }
+
+    /// Write one row + run threshold-triggered auto-commit. Propagates
+    /// serialise AND auto-commit errors (architecture.md section 11).
+    /// Shared between `Write` and `WriteTo` arms.
+    async fn write_one(&mut self, table: &str, row: &T) -> Result<()> {
+        let inserter = self.get_or_create(table);
+        match inserter.write(row).await {
+            Ok(()) => inserter.commit().await.map(|_| ()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl<T> CommandWorker for InserterWorker<T>
@@ -197,24 +208,17 @@ where
                     )));
                     return;
                 };
-                let inserter = self.get_or_create(table.as_ref());
-                let result = inserter.write(&row).await;
-                if result.is_ok() {
-                    let _ = inserter.commit().await;
-                }
-                let _ = resp.send(result);
+                let _ = resp.send(self.write_one(table.as_ref(), &row).await);
             }
             AsyncInserterCommand::WriteTo(table, row, resp) => {
-                let inserter = self.get_or_create(&table);
-                let result = inserter.write(&row).await;
-                if result.is_ok() {
-                    let _ = inserter.commit().await;
-                }
-                let _ = resp.send(result);
+                let _ = resp.send(self.write_one(&table, &row).await);
             }
             AsyncInserterCommand::Flush(resp) => {
+                // All-or-nothing across tables (architecture.md 11.1 P4).
+                // First failure aborts; not-yet-flushed tables keep
+                // their buffers; already-flushed tables are in CH
+                // (replay relies on server-side dedup -- 11.2).
                 let mut total = Quantities::ZERO;
-                let mut last_err: Option<Error> = None;
                 for inserter in self.inserters.values_mut() {
                     match inserter.force_commit().await {
                         Ok(q) => {
@@ -223,10 +227,13 @@ where
                             total.transactions =
                                 total.transactions.saturating_add(q.transactions);
                         }
-                        Err(e) => last_err = Some(e),
+                        Err(e) => {
+                            let _ = resp.send(Err(e));
+                            return;
+                        }
                     }
                 }
-                let _ = resp.send(last_err.map_or(Ok(total), Err));
+                let _ = resp.send(Ok(total));
             }
             AsyncInserterCommand::End(resp) => {
                 let mut total = Quantities::ZERO;
@@ -383,9 +390,19 @@ where
         }
     }
 
-    /// Serialise and buffer a row. Asynchronously blocks if the channel
-    /// is full. Returns after the row is buffered and any threshold-
-    /// triggered auto-commit has completed.
+    /// Serialise and buffer a row. Asynchronously blocks if the
+    /// channel is full. Returns after the row is buffered and any
+    /// threshold-triggered auto-commit has completed.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if the row failed to serialise, or if a threshold-
+    /// triggered auto-commit during this `write` failed. Auto-commit
+    /// errors propagate through the `Result` rather than being
+    /// swallowed -- callers must observe before advancing any
+    /// upstream commit pointer (e.g. Kafka offset). The row itself
+    /// was buffered successfully; retry policy is the caller's
+    /// (architecture.md section 11.5).
     pub async fn write(&self, row: T) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.handle
@@ -398,6 +415,11 @@ where
     /// Serialise + buffer a row for `table`. Creates a per-table
     /// buffer on first sight. Works in single-table or multi-table
     /// mode (fan-in across schema-compatible tables).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`write`][Self::write]: serialisation + auto-commit
+    /// errors propagate through the `Result`.
     pub async fn write_to(&self, table: &str, row: T) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.handle
@@ -414,15 +436,25 @@ where
     /// Force-flush every per-table buffer; returns summed
     /// [`Quantities`] (zero per empty buffer).
     ///
-    /// # Failure semantics (this layer)
+    /// # Failure semantics
     ///
-    /// Best-effort multi-table: every per-table flush is attempted,
-    /// `Quantities` sums successes, the last error is surfaced.
-    /// Tables flushed before a failure have already committed.
-    /// Layer 04-failure-semantics tightens this to all-or-nothing
-    /// (architecture.md sections 11.1 P4 and 11.2). At-least-once
-    /// replay needs server-side dedup
-    /// (`insert_deduplicate=1` on non-replicated tables).
+    /// All-or-nothing across tables. First per-table failure aborts
+    /// the rest; caller gets the error without summed `Quantities`.
+    /// Pre-failure tables have already committed; post-failure tables
+    /// keep their buffers for retry.
+    ///
+    /// At-least-once replay needs server-side block-level dedup.
+    /// `ReplicatedMergeTree` has this by default
+    /// (`replicated_deduplication_window=100`); for non-replicated,
+    /// set `insert_deduplicate=1`. See architecture.md sections
+    /// 11.1 P4 and 11.2.
+    ///
+    /// # Errors
+    ///
+    /// First per-table flush error (HTTP 4xx/5xx, schema mismatch,
+    /// etc.). Caller drives retry; the library does not preserve
+    /// row buffers across transport failures
+    /// (architecture.md section 11.5).
     pub async fn flush(&self) -> Result<Quantities> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.handle
@@ -432,9 +464,21 @@ where
         resp_rx.await.map_err(|_| channel_closed_err())?
     }
 
-    /// Graceful shutdown: flush, end INSERT, stop the task. Returns
-    /// the final batch's [`Quantities`]. Consumes `self`; cloned
-    /// handles become inert.
+    /// Graceful shutdown: flush remaining rows, end the underlying
+    /// INSERT, and stop the background task. Returns the final batch's
+    /// [`Quantities`].
+    ///
+    /// Consumes `self`. Cloned [`AsyncInserterHandle`]s become inert
+    /// (their `write`/`flush` calls return errors) once shutdown
+    /// completes.
+    ///
+    /// # Failure semantics
+    ///
+    /// Best-effort across tables (unlike [`flush`][Self::flush]).
+    /// Every per-table end is attempted; `Quantities` sums successes;
+    /// last error is surfaced. No replay path past end -- partial
+    /// loss is the cost of graceful shutdown (the alternative loses
+    /// MORE rows).
     pub async fn end(mut self) -> Result<Quantities> {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self
