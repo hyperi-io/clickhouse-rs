@@ -20,6 +20,7 @@ use crate::compression::zstd::ZstdHttpDecoder;
 use crate::{
     compression::Compression,
     error::{Error, Result},
+    progress::{Progress, ProgressCallback},
     query_summary::QuerySummary,
 };
 use tracing::Instrument;
@@ -38,7 +39,11 @@ pub(crate) type ResponseFuture =
     Pin<Box<dyn Future<Output = Result<(Chunks, Option<Box<QuerySummary>>)>> + Send>>;
 
 impl Response {
-    pub(crate) fn new(response: HyperResponseFuture, compression: Compression) -> Self {
+    pub(crate) fn new(
+        response: HyperResponseFuture,
+        compression: Compression,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Self {
         let span = tracing::info_span!(
             "response",
             otel.status_code = tracing::field::Empty,
@@ -48,7 +53,7 @@ impl Response {
         );
 
         Self::Waiting(Box::pin(
-            collect_response(response, compression).instrument(span),
+            collect_response(response, compression, progress_callback).instrument(span),
         ))
     }
 
@@ -78,11 +83,24 @@ impl Response {
 async fn collect_response(
     response: HyperResponseFuture,
     compression: Compression,
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<(Chunks, Option<Box<QuerySummary>>)> {
     let response = response.await?;
 
     let status = response.status();
     let exception_code = response.headers().get("X-ClickHouse-Exception-Code");
+
+    // X-ClickHouse-Progress at response init only; trailers needed
+    // for mid-response (see progress module docs).
+    if let Some(cb) = progress_callback.as_ref() {
+        for value in response.headers().get_all("X-ClickHouse-Progress") {
+            if let Ok(s) = value.to_str()
+                && let Some(progress) = Progress::from_header_value(s)
+            {
+                cb(&progress);
+            }
+        }
+    }
 
     tracing::record_all!(
         tracing::Span::current(),

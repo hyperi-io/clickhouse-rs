@@ -269,6 +269,7 @@ mod mock;
 mod nested;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
+mod progress;
 mod query;
 mod query_readonly;
 mod query_summary;

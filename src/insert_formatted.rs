@@ -480,7 +480,11 @@ impl InsertFormatted {
         let future = client.http.request(request);
 
         // Ensure the span created internally is captured as a child of the current span.
-        let mut response = Response::new(future, Compression::None);
+        let mut response = Response::new(
+            future,
+            Compression::None,
+            client.progress_callback(),
+        );
 
         // TODO: introduce `Executor` to allow bookkeeping of spawned tasks.
         let handle = tokio::spawn(async move { response.finish().await });

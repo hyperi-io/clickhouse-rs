@@ -257,7 +257,11 @@ impl Query {
         })?;
 
         let future = self.client.http.request(request);
-        Ok(Response::new(future, self.client.compression))
+        Ok(Response::new(
+            future,
+            self.client.compression,
+            self.client.progress_callback(),
+        ))
     }
 
     /// Configure the [roles] to use when executing this query.
