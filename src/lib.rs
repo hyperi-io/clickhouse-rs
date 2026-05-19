@@ -28,6 +28,11 @@ pub mod serde;
 pub mod sql;
 #[cfg(feature = "test-util")]
 pub mod test;
+// Internal background-worker primitive (CommandWorker trait + spawn).
+// `pub(crate)` until a second consumer arrives -- currently only
+// `async_inserter` uses it. Promote to `pub mod` when the TCP transport
+// or another long-lived actor lands.
+pub(crate) mod worker;
 
 pub mod types;
 
