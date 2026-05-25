@@ -165,13 +165,17 @@ impl<T> Insert<T> {
     ///
     /// A returned future doesn't depend on the row's lifetime.
     ///
-    /// Returns an error if the row cannot be serialized or the background task
-    /// failed. Once failed, the whole `INSERT` is aborted and cannot be
-    /// used anymore.
+    /// # Failure semantics
     ///
-    /// # Panics
+    /// `Err` if the row cannot be serialised, or if the background
+    /// task driving the HTTP request has already failed.
     ///
-    /// If called after the previous call that returned an error.
+    /// On serialise error the row's partial bytes are truncated from
+    /// the buffer; previously buffered rows are kept and the `Insert`
+    /// remains usable -- subsequent `write` / `end` calls work as
+    /// normal. On transport error from the background task (mid-
+    /// stream chunk flush), the `INSERT` is aborted and further
+    /// `write` calls also return `Err`.
     pub fn write<'a>(
         &'a mut self,
         row: &T::Value<'_>,
@@ -193,7 +197,13 @@ impl<T> Insert<T> {
         }
     }
 
-    /// Returns the number of bytes written, not including the RBWNAT header.
+    /// Bytes written (excl. RBWNAT header).
+    ///
+    /// # Failure semantics
+    ///
+    /// Serialise error truncates this row's bytes; the buffer keeps
+    /// earlier successful rows. Transport errors still abort, but
+    /// those happen at flush, not here.
     #[inline(always)]
     pub(crate) fn do_write(&mut self, row: &T::Value<'_>) -> Result<usize>
     where
@@ -213,12 +223,14 @@ impl<T> Insert<T> {
         };
         let written = buffer.len() - old_buf_size;
 
-        if let Err(e) = &result {
+        if let Err(e) = result {
             e.record_in_current_span("error serializing row");
-            self.abort();
+            // Roll back this row's bytes; keep earlier rows.
+            buffer.truncate(old_buf_size);
+            return Err(e);
         }
 
-        result.and(Ok(written))
+        Ok(written)
     }
 
     /// Ends `INSERT`, the server starts processing the data.

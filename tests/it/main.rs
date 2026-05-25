@@ -249,6 +249,7 @@ pub(crate) mod decimals {
 mod chrono;
 mod cloud_jwt;
 mod compression;
+mod async_inserter;
 mod cursor_error;
 mod cursor_reborrow;
 mod cursor_stats;
@@ -272,6 +273,8 @@ mod query_syntax;
 mod rbwnat_header;
 mod rbwnat_smoke;
 mod rbwnat_validation;
+mod row_serde_isolation;
+mod row_serde_isolation_live;
 mod time;
 mod user_agent;
 mod uuid;

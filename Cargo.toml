@@ -60,6 +60,11 @@ harness = false
 name = "mocked_select"
 harness = false
 
+[[bench]]
+name = "async_inserter"
+harness = false
+required-features = ["inserter", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]
