@@ -252,13 +252,14 @@ mod compression;
 mod cursor_error;
 mod cursor_reborrow;
 mod cursor_stats;
-mod insert_native;
 mod fetch_bytes;
 mod https_errors;
 mod insert;
 mod insert_formatted;
+mod insert_native;
 #[cfg(feature = "inserter")]
 mod inserter;
+mod native_roundtrip_live;
 mod int128;
 mod int256;
 mod ip;

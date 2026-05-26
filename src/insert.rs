@@ -42,6 +42,11 @@ pub struct Insert<T> {
     insert: BufInsertFormatted,
     row_metadata: Option<RowMetadata>,
     sent_rows: Saturating<u64>,
+    /// Cached so [`Insert::with_native_format`] can hand client+table+
+    /// metadata off to [`crate::insert_native::InsertNative`] without
+    /// re-running the `DESCRIBE TABLE` round-trip.
+    client: Client,
+    table: String,
     _marker: PhantomData<fn() -> T>, // TODO: test contravariance.
 }
 
@@ -65,8 +70,54 @@ impl<T> Insert<T> {
                 .buffered_with_capacity(BUFFER_SIZE),
             row_metadata,
             sent_rows: Saturating(0),
+            client: client.clone(),
+            table: table.to_string(),
             _marker: PhantomData,
         }
+    }
+
+    /// Switch this `Insert<T>` to use the ClickHouse `Native`
+    /// (columnar) format instead of `RowBinary`. Returns an
+    /// [`InsertNative<T>`][crate::insert_native::InsertNative] -- the
+    /// same type [`Client::insert_native`] returns -- preserving the
+    /// resolved column schema (no second `DESCRIBE TABLE` call) and
+    /// the underlying client.
+    ///
+    /// Builder methods set on the original `Insert<T>` (timeouts,
+    /// roles, settings) are NOT copied -- this is a one-shot
+    /// constructor handoff. Set those on the returned
+    /// `InsertNative<T>` if needed (or call
+    /// [`Client::insert_native`] directly to skip this two-step
+    /// dance).
+    ///
+    /// # Errors
+    ///
+    /// `Err(Error::Other)` if any rows have already been written
+    /// via [`write`][Self::write] -- the format change must happen
+    /// before the request body starts. `Err(Error::Other)` if the
+    /// `Insert<T>` was constructed without validation (no
+    /// `RowMetadata`), since the Native format requires per-column
+    /// type information that only DESCRIBE TABLE provides.
+    pub fn with_native_format(self) -> Result<crate::insert_native::InsertNative<T>>
+    where
+        T: Row,
+    {
+        if self.sent_rows.0 != 0 {
+            return Err(crate::error::Error::Other(
+                "with_native_format() must be called before any write(); \
+                 rows have already been buffered for the RowBinary path"
+                    .into(),
+            ));
+        }
+        let metadata = self.row_metadata.ok_or_else(|| {
+            crate::error::Error::Other(
+                "with_native_format() requires the Insert to have been built \
+                 with validation on (Client::insert(table) by default); the \
+                 Native format needs per-column type metadata"
+                    .into(),
+            )
+        })?;
+        crate::insert_native::InsertNative::new(&self.client, &self.table, metadata)
     }
 
     /// Sets timeouts for different operations.
