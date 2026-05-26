@@ -81,7 +81,7 @@ async fn run_write_buffer(iters: u64) -> Result<Duration> {
 
     let start = Instant::now();
     for i in 0..iters {
-        insert.write(&SampleRow::new(i))?;
+        insert.write(&SampleRow::new(i)).await?;
     }
     let elapsed = start.elapsed();
     insert.end().await?;
@@ -102,7 +102,7 @@ async fn run_end_to_end<const N: usize>(iters: u64) -> Result<Duration> {
         let mut insert: InsertNative<SampleRow> =
             InsertNative::with_columns(&client, "bench_table", &cols)?;
         for i in 0..N as u64 {
-            insert.write(&SampleRow::new(i))?;
+            insert.write(&SampleRow::new(i)).await?;
         }
         insert.end().await?;
     }
