@@ -97,20 +97,35 @@ pub fn encode_columns(
         return Ok(Vec::new());
     }
 
-    // Pass 1 -- extract per-column raw RowBinary value bytes (one per row).
+    // Pass 1 -- record per-column byte ranges into the original row
+    // buffers (no copy, no per-cell allocation). For 1M rows x N
+    // columns this avoids 1M x N heap allocations versus the
+    // previous `to_vec()` approach.
     let n = rows.len();
-    let mut per_col: Vec<Vec<Vec<u8>>> = vec![Vec::with_capacity(n); columns.len()];
+    let mut per_col: Vec<Vec<&[u8]>> = (0..columns.len())
+        .map(|_| Vec::with_capacity(n))
+        .collect();
     for row in rows {
         let mut pos = 0;
         for (ci, col) in columns.iter().enumerate() {
             let start = pos;
             rb_advance(row, &mut pos, &col.col_type)?;
-            per_col[ci].push(row[start..pos].to_vec());
+            per_col[ci].push(&row[start..pos]);
         }
     }
 
     // Pass 2 -- emit header + native-encoded data for each column.
-    let mut out = Vec::new();
+    //
+    // Pre-size `out` from the sum of recorded slice lengths plus a
+    // small overhead per column (~32 bytes for name + type + flag
+    // byte). Avoids reallocations during `extend_from_slice` calls
+    // -- the realloc cost dominated for wide schemas.
+    let payload_size: usize = per_col.iter().flat_map(|c| c.iter().map(|s| s.len())).sum();
+    let header_size: usize = columns
+        .iter()
+        .map(|c| c.name.len() + c.type_name.len() + 16)
+        .sum();
+    let mut out = Vec::with_capacity(payload_size + header_size);
     for (ci, col) in columns.iter().enumerate() {
         out.put_string(col.name.as_bytes());
         out.put_string(col.type_name.as_bytes());
@@ -126,7 +141,7 @@ pub fn encode_columns(
 
 /// Recursively write native columnar data for `values` (one `Vec<u8>` per row,
 /// containing raw RowBinary bytes for a single value).
-fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>) -> Result<()> {
+fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) -> Result<()> {
     // Fixed-size scalars, String, and FixedString: RowBinary bytes == native bytes.
     if col_type.fixed_size().is_some()
         || matches!(
@@ -158,7 +173,8 @@ fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>
                     inner_vals.push(def);
                 }
             }
-            write_col_values(&inner_vals, inner, out)?;
+            let inner_refs: Vec<&[u8]> = inner_vals.iter().map(|v| v.as_slice()).collect();
+            write_col_values(&inner_refs, inner, out)?;
         }
 
         ColumnType::LowCardinality(inner) => {
@@ -205,7 +221,7 @@ fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>
                         Some(v[1..].to_vec()) // extract T bytes
                     }
                 } else {
-                    Some(v.clone())
+                    Some(v.to_vec())
                 };
 
                 let idx = match key {
@@ -242,7 +258,9 @@ fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>
             out.extend_from_slice(&1u64.to_le_bytes()); // version
             out.extend_from_slice(&flags.to_le_bytes()); // flags
             out.extend_from_slice(&(dict.len() as u64).to_le_bytes()); // dict_size
-            write_col_values(&dict, dict_type, out)?; // dict values (type = T, not Nullable(T))
+            // Convert owned dict bytes to slice references for the recursive call.
+            let dict_refs: Vec<&[u8]> = dict.iter().map(|v| v.as_slice()).collect();
+            write_col_values(&dict_refs, dict_type, out)?; // dict values (type = T, not Nullable(T))
             out.extend_from_slice(&(indices.len() as u64).to_le_bytes()); // num_indices
             let ibytes = [1usize, 2, 4, 8][index_type as usize];
             for idx in &indices {
@@ -272,7 +290,8 @@ fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>
             for off in &offsets {
                 out.extend_from_slice(&off.to_le_bytes());
             }
-            write_col_values(&all_elems, inner, out)?;
+            let elem_refs: Vec<&[u8]> = all_elems.iter().map(|v| v.as_slice()).collect();
+            write_col_values(&elem_refs, inner, out)?;
         }
 
         ColumnType::Map(key_type, val_type) => {
@@ -301,8 +320,10 @@ fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>
             for off in &offsets {
                 out.extend_from_slice(&off.to_le_bytes());
             }
-            write_col_values(&all_keys, key_type, out)?;
-            write_col_values(&all_vals, val_type, out)?;
+            let key_refs: Vec<&[u8]> = all_keys.iter().map(|v| v.as_slice()).collect();
+            let val_refs: Vec<&[u8]> = all_vals.iter().map(|v| v.as_slice()).collect();
+            write_col_values(&key_refs, key_type, out)?;
+            write_col_values(&val_refs, val_type, out)?;
         }
 
         ColumnType::Tuple(fields) => {
@@ -318,7 +339,9 @@ fn write_col_values(values: &[Vec<u8>], col_type: &ColumnType, out: &mut Vec<u8>
                 }
             }
             for (fi, field_type) in fields.iter().enumerate() {
-                write_col_values(&field_vals[fi], field_type, out)?;
+                let field_refs: Vec<&[u8]> =
+                    field_vals[fi].iter().map(|v| v.as_slice()).collect();
+                write_col_values(&field_refs, field_type, out)?;
             }
         }
 
