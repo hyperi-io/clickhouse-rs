@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 pub mod error;
 pub mod insert;
 pub mod insert_formatted;
+pub mod insert_native;
 #[cfg(feature = "inserter")]
 pub mod inserter;
 pub mod query;
@@ -33,7 +34,7 @@ pub mod types;
 
 mod bytes_ext;
 mod compression;
-mod native;
+pub mod native;
 mod cursors;
 mod headers;
 mod http_client;
@@ -487,6 +488,29 @@ impl Client {
         inserter::Inserter::new(self, table)
     }
 
+    /// Start a new `INSERT` statement that will ship rows in the
+    /// ClickHouse `Native` (columnar) format over HTTP.
+    ///
+    /// Like [`Client::insert`], this resolves the column schema from
+    /// the server (one DESCRIBE TABLE per call, cached). Buffers
+    /// rows in memory and ships a single Native block at
+    /// [`InsertNative::end`][insert_native::InsertNative::end] time --
+    /// fine for typical batch sizes; for very large inserts use
+    /// multiple `InsertNative` instances or wait for a chunked
+    /// follow-up.
+    pub async fn insert_native<T: Row>(
+        &self,
+        table: &str,
+    ) -> Result<insert_native::InsertNative<T>> {
+        let mut escaped_table_name = String::new();
+        sql::escape::identifier(table, &mut escaped_table_name)
+            .map_err(|e| Error::Other(format!("error escaping table name: {e:?}").into()))?;
+
+        let metadata = self.get_insert_metadata(&escaped_table_name).await?;
+        let row = metadata.to_row::<T>()?;
+        insert_native::InsertNative::new(self, &escaped_table_name, row)
+    }
+
     /// Start an `INSERT` statement sending pre-formatted data.
     ///
     /// `sql` should be an `INSERT INTO ... FORMAT <format name>` statement.
@@ -667,6 +691,10 @@ impl Client {
 mod formats {
     pub(crate) const ROW_BINARY: &str = "RowBinary";
     pub(crate) const ROW_BINARY_WITH_NAMES_AND_TYPES: &str = "RowBinaryWithNamesAndTypes";
+    /// ClickHouse Native columnar block format
+    /// (<https://clickhouse.com/docs/interfaces/formats#native>).
+    /// Used by [`insert::Insert::with_native_format`].
+    pub(crate) const NATIVE: &str = "Native";
 }
 
 mod settings {

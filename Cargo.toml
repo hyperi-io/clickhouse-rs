@@ -60,6 +60,16 @@ harness = false
 name = "mocked_select"
 harness = false
 
+[[bench]]
+name = "native_encode"
+harness = false
+required-features = ["lz4", "test-util"]
+
+[[bench]]
+name = "insert_native"
+harness = false
+required-features = ["lz4", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]

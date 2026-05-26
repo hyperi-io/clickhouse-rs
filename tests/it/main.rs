@@ -252,6 +252,7 @@ mod compression;
 mod cursor_error;
 mod cursor_reborrow;
 mod cursor_stats;
+mod insert_native;
 mod fetch_bytes;
 mod https_errors;
 mod insert;

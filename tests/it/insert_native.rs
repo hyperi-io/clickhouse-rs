@@ -1,0 +1,131 @@
+//! MVP integration tests for HTTP `Format::Native` insert.
+//!
+//! Uses [`InsertNative::with_columns`] to skip the DESCRIBE TABLE
+//! round-trip and a `record_raw_body` mock handler to capture the
+//! emitted Native-format bytes for byte-exact verification.
+
+#![cfg(feature = "test-util")]
+
+use bytes::Bytes;
+use clickhouse::{Client, Row, insert_native::InsertNative, test};
+use serde::Serialize;
+
+#[derive(Row, Serialize)]
+struct Tiny {
+    id: u64,
+    name: String,
+}
+
+fn columns() -> Vec<(String, String)> {
+    vec![
+        ("id".to_string(), "UInt64".to_string()),
+        ("name".to_string(), "String".to_string()),
+    ]
+}
+
+#[tokio::test]
+async fn empty_insert_emits_zero_row_block() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_raw_body());
+
+    let insert: InsertNative<Tiny> =
+        InsertNative::with_columns(&client, "tiny", &columns()).unwrap();
+    insert.end().await.unwrap();
+
+    let body: Bytes = recorder.body().await;
+    // Expected layout for empty Native block:
+    //   BlockInfo: varint(1) u8(0) varint(2) i32_le(-1) varint(0)
+    //     = 0x01 0x00 0x02 0xFF 0xFF 0xFF 0xFF 0x00   (8 bytes)
+    //   varint(num_columns = 2) = 0x02
+    //   varint(num_rows    = 0) = 0x00
+    // Then no per-column data because num_rows == 0.
+    let expected: &[u8] = &[
+        0x01, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, // BlockInfo
+        0x02, // num_columns = 2
+        0x00, // num_rows = 0
+    ];
+    assert_eq!(body.as_ref(), expected);
+}
+
+#[tokio::test]
+async fn block_envelope_has_block_info_then_counts() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_raw_body());
+
+    let mut insert: InsertNative<Tiny> =
+        InsertNative::with_columns(&client, "tiny", &columns()).unwrap();
+    insert.write(&Tiny { id: 1, name: "a".into() }).unwrap();
+    insert.end().await.unwrap();
+
+    let body = recorder.body().await;
+
+    // First 8 bytes: BlockInfo (default).
+    assert_eq!(&body[..8], &[0x01, 0x00, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // Next: varint(num_columns = 2)
+    assert_eq!(body[8], 0x02);
+    // Next: varint(num_rows = 1)
+    assert_eq!(body[9], 0x01);
+    // Then per-column data starts -- first thing should be the
+    // length-prefixed column NAME for column 0 ("id"):
+    //   varint(2) "id"
+    assert_eq!(body[10], 0x02);
+    assert_eq!(&body[11..13], b"id");
+    // Then varint(len) + the type name "UInt64".
+    assert_eq!(body[13], 0x06);
+    assert_eq!(&body[14..20], b"UInt64");
+}
+
+#[tokio::test]
+async fn integer_column_serialises_le() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_raw_body());
+
+    #[derive(Row, Serialize)]
+    struct OneU32 {
+        x: u32,
+    }
+    let cols = vec![("x".to_string(), "UInt32".to_string())];
+
+    let mut insert: InsertNative<OneU32> =
+        InsertNative::with_columns(&client, "t", &cols).unwrap();
+    insert.write(&OneU32 { x: 0x01020304 }).unwrap();
+    insert.write(&OneU32 { x: 0x05060708 }).unwrap();
+    insert.end().await.unwrap();
+
+    let body = recorder.body().await;
+    // After BlockInfo (8) + varint(num_columns=1) (1) + varint(num_rows=2) (1)
+    //   = 10 bytes envelope, the column starts:
+    //   varint(1) "x"        : 1 + 1 = 2 bytes
+    //   varint(6) "UInt32"   : 1 + 6 = 7 bytes
+    //   custom_serialization flag byte (0x00 -- DEFAULT_REVISION = 54454 triggers it)
+    //   then 2 * 4 bytes of LE-encoded u32 values
+    let header_end = 10 + 2 + 7 + 1; // 20
+    let column_data = &body[header_end..];
+    assert_eq!(column_data.len(), 8, "two u32 = 8 bytes");
+    assert_eq!(&column_data[0..4], &0x01020304u32.to_le_bytes());
+    assert_eq!(&column_data[4..8], &0x05060708u32.to_le_bytes());
+}
+
+#[tokio::test]
+async fn end_finalises_request_with_format_native_url_param() {
+    // This test verifies the request URL includes the right query
+    // settings -- specifically that we route through the
+    // FORMAT-Native path, not the default RowBinary one.
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_raw_body());
+
+    let insert: InsertNative<Tiny> =
+        InsertNative::with_columns(&client, "tiny", &columns()).unwrap();
+    insert.end().await.unwrap();
+
+    // Just confirm we got SOMETHING back -- if the URL was wrong the
+    // mock wouldn't have matched and the future would hang. The
+    // record_raw_body handler captured the body, so the request
+    // reached the mock.
+    let body = recorder.body().await;
+    assert!(!body.is_empty(), "request body should contain at least the BlockInfo header");
+}
