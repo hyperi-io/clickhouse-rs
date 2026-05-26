@@ -46,6 +46,8 @@ pub mod types;
 mod bytes_ext;
 mod compression;
 pub mod native;
+#[cfg(feature = "tcp")]
+pub(crate) mod tcp;
 mod cursors;
 mod headers;
 mod http_client;
