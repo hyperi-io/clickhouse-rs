@@ -110,11 +110,31 @@ impl Query {
 
         self.sql.bind_fields::<T>();
 
+        // Snapshot the KILL-on-drop handle BEFORE consuming
+        // `self.client` in `do_execute`. Capture the runtime
+        // Handle now so RowCursor::drop can spawn the kill on the
+        // same runtime even if Drop runs after the TLS current-
+        // runtime has been torn down (e.g. block_on scope-exit
+        // after SIGTERM).
+        let kill_on_drop = self
+            .client
+            .kill_on_drop_handle()
+            .map(|(client, query_id)| crate::cursors::row::KillOnDropHandle {
+                client,
+                query_id,
+                runtime: tokio::runtime::Handle::current(),
+            });
+
         let response = self
             .do_execute(Some(format))
             .inspect_err(|e| e.record_in_current_span("error executing fetch"))?;
 
-        Ok(RowCursor::new(response, validation, span.exit()))
+        Ok(RowCursor::new(
+            response,
+            validation,
+            span.exit(),
+            kill_on_drop,
+        ))
     }
 
     /// Executes the query and returns just a single row.
@@ -303,6 +323,21 @@ impl Query {
     pub fn with_setting(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.client.set_setting(name, value);
         self
+    }
+
+    /// Set the server-side `query_id` for this query.
+    ///
+    /// The id is sent as a URL parameter and appears in
+    /// `system.query_log` / `system.processes`. Pair with
+    /// [`Client::kill_query`][crate::Client::kill_query] to cancel
+    /// in-flight queries when the consumer abandons the cursor
+    /// before draining the full result -- otherwise the server
+    /// keeps processing until it tries to write to a dead socket.
+    ///
+    /// Convention: use a UUID (v7 preferred for k-sortability) or
+    /// an app-prefixed identifier (`"my-app/req-12345"`).
+    pub fn with_query_id(self, id: impl Into<String>) -> Self {
+        self.with_setting(crate::settings::QUERY_ID, id)
     }
 
     /// Specify server side parameter for query.

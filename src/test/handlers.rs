@@ -212,7 +212,7 @@ where
 {
     /// Wait for the request and return `(uri, rows)`. `uri` is the
     /// full request URI string (path + query); `rows` are
-    /// RowBinary-decoded.
+    /// RowBinary-decoded from the request body.
     pub async fn collect<C>(self) -> (String, C)
     where
         C: Default + Extend<T>,
@@ -226,6 +226,14 @@ where
             rows.extend(std::iter::once(row));
         }
         (uri, rows)
+    }
+
+    /// Wait for the request and return just the URI. Useful for
+    /// tests where the body shape doesn't decode as `T` (e.g.
+    /// SELECTs where the body carries the SQL text, not row data).
+    pub async fn collect_uri(self) -> String {
+        let (uri, _bytes) = self.rx.await.expect("query canceled");
+        uri
     }
 }
 

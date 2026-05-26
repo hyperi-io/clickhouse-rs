@@ -17,6 +17,18 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
+/// Captured at cursor construction; on `Drop`, spawns a background
+/// task that issues `KILL QUERY` against the server. Drop-on-cursor:
+/// recovers server-side resources when consumers abandon cursors
+/// without draining. Holds the runtime `Handle` captured at
+/// construction so the spawn survives a TLS-runtime that's been
+/// torn down by the caller's `block_on` scope-exit.
+pub(crate) struct KillOnDropHandle {
+    pub(crate) client: crate::Client,
+    pub(crate) query_id: String,
+    pub(crate) runtime: tokio::runtime::Handle,
+}
+
 /// A cursor that emits rows deserialized as structures from RowBinary.
 #[must_use]
 pub struct RowCursor<T> {
@@ -28,11 +40,22 @@ pub struct RowCursor<T> {
     row_metadata: Option<RowMetadata>,
     span: tracing::Span,
     returned_rows: u64,
+    /// Set when the cursor's body stream returns `Ready(None)` -- the
+    /// server is done with the query. KILL is then unnecessary; we
+    /// skip the Drop-time KILL to avoid wasting a round-trip on an
+    /// already-completed query.
+    consumed: bool,
+    kill_on_drop: Option<KillOnDropHandle>,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<T> RowCursor<T> {
-    pub(crate) fn new(response: Response, validation: bool, span: tracing::Span) -> Self {
+    pub(crate) fn new(
+        response: Response,
+        validation: bool,
+        span: tracing::Span,
+        kill_on_drop: Option<KillOnDropHandle>,
+    ) -> Self {
         Self {
             _marker: PhantomData,
             raw: RawCursor::new(response),
@@ -41,6 +64,8 @@ impl<T> RowCursor<T> {
             validation,
             span,
             returned_rows: 0,
+            consumed: false,
+            kill_on_drop,
         }
     }
 
@@ -183,6 +208,10 @@ impl<T> RowCursor<T> {
             match ready!(self.raw.poll_next(cx)) {
                 Ok(Some(chunk)) => bytes.extend(chunk),
                 Ok(None) => {
+                    // Stream ended naturally -- mark consumed so the
+                    // Drop impl skips the KILL QUERY (already
+                    // done server-side).
+                    self.consumed = true;
                     return if bytes.remaining() > 0 {
                         // If some data is left, we have an incomplete row in the buffer.
                         // This is usually a schema mismatch on the client side.
@@ -248,6 +277,42 @@ impl<T> Drop for RowCursor<T> {
         );
 
         tracing::debug!("finished typed query");
+
+        // Drop-on-cursor: if the cursor was dropped BEFORE the body
+        // finished (consumer abandoned), spawn a background task that
+        // issues KILL QUERY. We only do this when `kill_on_drop` is
+        // set (caller opted in via `Client::with_kill_on_drop`) AND
+        // the cursor wasn't fully consumed -- KILLing a completed
+        // query is harmless but wastes a round-trip.
+        //
+        // Uses the runtime `Handle` captured at construction time
+        // rather than `tokio::spawn`'s thread-local current-runtime
+        // lookup. The TLS lookup fails when the cursor outlives its
+        // spawning runtime (the typical pod-SIGTERM /
+        // runtime::block_on scope-exit case); the captured Handle
+        // keeps the kill reliable until the runtime is fully
+        // shut down.
+        if !self.consumed
+            && let Some(kod) = self.kill_on_drop.take()
+        {
+            let KillOnDropHandle { client, query_id, runtime } = kod;
+            // Handle::spawn returns a JoinHandle whose future runs on
+            // the captured runtime even if no runtime is currently
+            // installed in TLS. We discard the JoinHandle; the
+            // background work is fire-and-forget. `drop(jh)` over
+            // `let _ = ...` because the latter triggers
+            // clippy::let_underscore_future.
+            drop(runtime.spawn(async move {
+                if let Err(err) = client.kill_query(&query_id).await {
+                    tracing::warn!(
+                        target: "clickhouse::cursors",
+                        query_id = %query_id,
+                        error = %err,
+                        "drop-on-cursor KILL QUERY failed"
+                    );
+                }
+            }));
+        }
     }
 }
 
