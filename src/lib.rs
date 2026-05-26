@@ -33,6 +33,7 @@ pub mod types;
 
 mod bytes_ext;
 mod compression;
+mod native;
 mod cursors;
 mod headers;
 mod http_client;
