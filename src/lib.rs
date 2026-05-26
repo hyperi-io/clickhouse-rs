@@ -492,12 +492,15 @@ impl Client {
     /// ClickHouse `Native` (columnar) format over HTTP.
     ///
     /// Like [`Client::insert`], this resolves the column schema from
-    /// the server (one DESCRIBE TABLE per call, cached). Buffers
-    /// rows in memory and ships a single Native block at
-    /// [`InsertNative::end`][insert_native::InsertNative::end] time --
-    /// fine for typical batch sizes; for very large inserts use
-    /// multiple `InsertNative` instances or wait for a chunked
-    /// follow-up.
+    /// the server (one DESCRIBE TABLE per call, cached). The
+    /// returned [`InsertNative<T>`][insert_native::InsertNative]
+    /// chunks the input into Native blocks bounded by row count
+    /// (default 100k rows) and serialised byte size (default
+    /// 10 MiB); both ceilings can be overridden via
+    /// [`with_max_rows_per_block`][insert_native::InsertNative::with_max_rows_per_block]
+    /// and
+    /// [`with_max_bytes_per_block`][insert_native::InsertNative::with_max_bytes_per_block].
+    /// `end()` ships the trailing partial block.
     pub async fn insert_native<T: Row>(
         &self,
         table: &str,
