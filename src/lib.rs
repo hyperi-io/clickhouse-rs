@@ -22,12 +22,13 @@ use tokio::sync::RwLock;
 pub mod async_inserter;
 pub mod batch_isolation;
 pub mod error;
-pub mod recovery;
 pub mod insert;
 pub mod insert_formatted;
 #[cfg(feature = "inserter")]
 pub mod inserter;
+pub mod progress;
 pub mod query;
+pub mod recovery;
 pub mod serde;
 pub mod sql;
 #[cfg(feature = "test-util")]
@@ -75,6 +76,11 @@ pub struct Client {
     products_info: Vec<ProductInfo>,
     validation: bool,
     insert_metadata_cache: Arc<InsertMetadataCache>,
+
+    /// Optional callback invoked for each `X-ClickHouse-Progress`
+    /// response header. See [`crate::progress`] for the
+    /// shape and server-side enablement (`send_progress_in_http_headers=1`).
+    progress_callback: Option<progress::ProgressCallback>,
 
     #[cfg(feature = "test-util")]
     mocked: bool,
@@ -140,6 +146,7 @@ impl Client {
             products_info: Vec::default(),
             validation: true,
             insert_metadata_cache: Arc::new(InsertMetadataCache::default()),
+            progress_callback: None,
             #[cfg(feature = "test-util")]
             mocked: false,
         }
@@ -554,6 +561,37 @@ impl Client {
     pub fn with_validation(mut self, enabled: bool) -> Self {
         self.validation = enabled;
         self
+    }
+
+    /// Register a callback for `X-ClickHouse-Progress` headers.
+    /// Requires `send_progress_in_http_headers=1` on the session
+    /// (not auto-set; pair with [`with_setting`][Self::with_setting]).
+    /// See [`crate::progress`] for the hyper limitation.
+    /// Synchronous -- do not block.
+    ///
+    /// ```no_run
+    /// # use clickhouse::Client;
+    /// let client = Client::default()
+    ///     .with_url("http://localhost:8123")
+    ///     .with_setting("send_progress_in_http_headers", "1")
+    ///     .with_progress_callback(|p| {
+    ///         tracing::info!(
+    ///             read_rows = p.read_rows,
+    ///             total = p.total_rows_to_read,
+    ///             "progress"
+    ///         );
+    ///     });
+    /// ```
+    pub fn with_progress_callback(
+        mut self,
+        callback: impl Fn(&progress::Progress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress_callback = Some(std::sync::Arc::new(callback));
+        self
+    }
+
+    pub(crate) fn progress_callback(&self) -> Option<progress::ProgressCallback> {
+        self.progress_callback.clone()
     }
 
     /// Clear table metadata that was previously received and cached.

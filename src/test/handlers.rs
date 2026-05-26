@@ -80,6 +80,40 @@ where
     )
 }
 
+// === provide_with_progress ===
+
+/// Like [`provide`], but emits one or more `X-ClickHouse-Progress`
+/// response headers (one per element in `progress_headers`). The
+/// raw header values are passed through verbatim; callers
+/// constructing them should match the server's format
+/// (a JSON object with quoted-numeric fields per
+/// [`crate::progress::Progress::from_header_value`]).
+///
+/// Used by 11a-callbacks-api tests to verify the progress callback
+/// fires correctly when the server emits headers.
+#[track_caller]
+pub fn provide_with_progress<T>(
+    rows: impl IntoIterator<Item = T>,
+    progress_headers: impl IntoIterator<Item: AsRef<str>>,
+) -> impl Handler
+where
+    T: Serialize + Row,
+{
+    let mut buffer = Vec::with_capacity(BUFFER_INITIAL_CAPACITY);
+    for row in rows {
+        rowbinary::serialize_row_binary(&mut buffer, &row).expect("failed to serialize");
+    }
+    let mut builder = Response::builder();
+    for header in progress_headers {
+        builder = builder.header("X-ClickHouse-Progress", header.as_ref());
+    }
+    Thunk(
+        builder
+            .body(Bytes::from(buffer))
+            .expect("invalid builder"),
+    )
+}
+
 // === record ===
 
 struct RecordHandler<T>(PhantomData<T>);

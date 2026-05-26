@@ -246,12 +246,12 @@ pub(crate) mod decimals {
     pub(crate) type Decimal128 = FixedPoint<i128, U12>; // Decimal(38, 12) = Decimal128(12)
 }
 
-mod chrono;
-mod cloud_jwt;
-mod compression;
 mod async_inserter;
 mod batch_isolation;
 mod batch_isolation_live;
+mod chrono;
+mod cloud_jwt;
+mod compression;
 mod cursor_error;
 mod cursor_reborrow;
 mod cursor_stats;
@@ -269,6 +269,7 @@ mod mock;
 mod nested;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
+mod progress;
 mod query;
 mod query_readonly;
 mod query_summary;

@@ -20,6 +20,7 @@ use crate::compression::zstd::ZstdHttpDecoder;
 use crate::{
     compression::Compression,
     error::{Error, Result},
+    progress::{ProgressCallback, dispatch_progress},
     query_summary::QuerySummary,
 };
 use tracing::Instrument;
@@ -38,7 +39,11 @@ pub(crate) type ResponseFuture =
     Pin<Box<dyn Future<Output = Result<(Chunks, Option<Box<QuerySummary>>)>> + Send>>;
 
 impl Response {
-    pub(crate) fn new(response: HyperResponseFuture, compression: Compression) -> Self {
+    pub(crate) fn new(
+        response: HyperResponseFuture,
+        compression: Compression,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Self {
         let span = tracing::info_span!(
             "response",
             otel.status_code = tracing::field::Empty,
@@ -48,7 +53,7 @@ impl Response {
         );
 
         Self::Waiting(Box::pin(
-            collect_response(response, compression).instrument(span),
+            collect_response(response, compression, progress_callback).instrument(span),
         ))
     }
 
@@ -78,11 +83,18 @@ impl Response {
 async fn collect_response(
     response: HyperResponseFuture,
     compression: Compression,
+    progress_callback: Option<ProgressCallback>,
 ) -> Result<(Chunks, Option<Box<QuerySummary>>)> {
     let response = response.await?;
 
     let status = response.status();
     let exception_code = response.headers().get("X-ClickHouse-Exception-Code");
+
+    // X-ClickHouse-Progress at response init only; trailers needed
+    // for mid-response (see progress module docs).
+    if let Some(cb) = progress_callback.as_ref() {
+        dispatch_progress(cb, response.headers().get_all("X-ClickHouse-Progress"));
+    }
 
     tracing::record_all!(
         tracing::Span::current(),
@@ -103,7 +115,14 @@ async fn collect_response(
             .and_then(QuerySummary::from_header)
             .map(Box::new); // More likely to be successful, start streaming.
         // It still can fail, but we'll handle it in `DetectDbException`.
-        Ok((Chunks::new(response.into_body(), compression, tag), summary))
+        // Progress callback is passed to `Chunks` so trailer frames
+        // (mid-response progress) are dispatched as bytes are consumed.
+        // The response-init dispatch above covers headers buffered
+        // before the first body byte.
+        Ok((
+            Chunks::new(response.into_body(), compression, tag, progress_callback),
+            summary,
+        ))
     } else {
         // An instantly failed request.
         let error = collect_bad_response(
@@ -200,8 +219,16 @@ pub(crate) struct Chunks {
 }
 
 impl Chunks {
-    fn new(stream: Incoming, compression: Compression, exception_tag: Option<Box<[u8]>>) -> Self {
-        let stream = IncomingStream(stream);
+    fn new(
+        stream: Incoming,
+        compression: Compression,
+        exception_tag: Option<Box<[u8]>>,
+        progress_callback: Option<ProgressCallback>,
+    ) -> Self {
+        let stream = IncomingStream {
+            body: stream,
+            progress_callback,
+        };
         let stream = Decompress::new(stream, compression);
         let stream = DetectDbException {
             stream,
@@ -246,21 +273,49 @@ impl Stream for Chunks {
 // === IncomingStream ===
 
 // * Produces bytes from incoming data frames.
-// * Skips trailer frames (CH doesn't use them for now).
+// * Dispatches `X-ClickHouse-Progress` from HTTP trailer frames to
+//   the registered progress callback (mid-response progress; the
+//   initial-headers set is handled at `collect_response`).
 // * Converts hyper errors to our own.
-struct IncomingStream(Incoming);
+struct IncomingStream {
+    body: Incoming,
+    progress_callback: Option<ProgressCallback>,
+}
 
 impl Stream for IncomingStream {
     type Item = Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut incoming = Pin::new(&mut self.get_mut().0);
+        let this = self.get_mut();
+        let mut incoming = Pin::new(&mut this.body);
 
         loop {
             break match incoming.as_mut().poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                     Ok(bytes) => Poll::Ready(Some(Ok(bytes))),
-                    Err(_frame) => continue,
+                    // Non-data frame; could be trailers. Best-effort:
+                    // extract trailers and dispatch any progress
+                    // headers we recognise. Silently ignored if it's
+                    // not a trailers frame.
+                    //
+                    // ClickHouse 24.x/25.x emits progress as RESPONSE
+                    // HEADERS (sent before the body, all in one block),
+                    // not as trailers -- that path is handled in
+                    // `collect_response`. The trailer path here is
+                    // defensive: future CH versions or alternative
+                    // endpoints may switch to trailer-based progress.
+                    // Note: HTTP/1.1 chunked-trailer parsers (hyper
+                    // included) deduplicate duplicate trailer keys, so
+                    // at most one X-ClickHouse-Progress trailer per
+                    // response is observable here.
+                    Err(frame) => {
+                        if let Some(cb) = this.progress_callback.as_ref()
+                            && let Ok(trailers) = frame.into_trailers()
+                        {
+                            dispatch_progress(cb, trailers.get_all("X-ClickHouse-Progress"));
+                        }
+                        continue;
+                    }
                 },
                 Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
                 Poll::Ready(None) => Poll::Ready(None),
