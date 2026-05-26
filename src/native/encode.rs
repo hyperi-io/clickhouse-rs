@@ -28,7 +28,7 @@ pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION: u64 = 5445
 
 /// Column schema entry for a native INSERT block.
 #[derive(Debug, Clone)]
-pub(crate) struct ColumnSchema {
+pub struct ColumnSchema {
     /// Column name as declared to the server.
     pub(crate) name: String,
     /// Type name string sent on the wire (LowCardinality stripped).
@@ -39,7 +39,7 @@ pub(crate) struct ColumnSchema {
 
 impl ColumnSchema {
     /// Build a `ColumnSchema` list from server-provided `(name, type_name)` pairs.
-    pub(crate) fn from_headers(headers: &[(String, String)]) -> Result<Vec<Self>> {
+    pub fn from_headers(headers: &[(String, String)]) -> Result<Vec<Self>> {
         headers
             .iter()
             .map(|(name, type_name)| {
@@ -87,7 +87,7 @@ impl ColumnSchema {
 ///
 /// Returns `Error::BadResponse` if any row's RowBinary data is truncated or
 /// contains an unsupported type for INSERT.
-pub(crate) fn encode_columns(
+pub fn encode_columns(
     rows: &[Vec<u8>],
     columns: &[ColumnSchema],
     revision: u64,

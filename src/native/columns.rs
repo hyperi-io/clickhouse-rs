@@ -13,8 +13,15 @@ use crate::error::{Error, Result};
 use crate::native::io::ClickHouseRead;
 
 /// Supported ClickHouse column types for native transport.
+///
+/// `#[non_exhaustive]` because ClickHouse adds new column types
+/// regularly (BFloat16, Variant, Dynamic, NewJson, etc. all
+/// already appear here). New variants are an additive forward-
+/// compatible change; without the attribute, every addition would
+/// be a breaking change for external code that exhaustively matches.
 #[derive(Debug, Clone)]
-pub(crate) enum ColumnType {
+#[non_exhaustive]
+pub enum ColumnType {
     UInt8,
     UInt16,
     UInt32,

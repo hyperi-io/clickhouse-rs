@@ -48,18 +48,24 @@
 //! Native-format blocks via the `format=Native` URL parameter (layer
 //! 05c). This module is the shared format-encoder/decoder both use.
 
-// Layer 05a is the format primitive; consumers in upstream are layer
-// 05c (HTTP `Format::Native` wiring -- next PR) and the future
+// The Native primitive has no in-tree consumer yet; users are the
+// sibling insert_native (HTTP `Format::Native` wiring) and the future
 // `src/tcp/` transport. Until those land, every public-
 // crate symbol here looks unused. The dead-code allowance scopes the
 // quiet to this module so the rest of the crate still benefits from
 // the lint.
 #![allow(dead_code)]
 
-pub(crate) mod block_info;
-pub(crate) mod columns;
+pub mod block_info;
+pub mod columns;
 #[cfg(feature = "lz4")]
-pub(crate) mod compression;
-pub(crate) mod encode;
-pub(crate) mod io;
-pub(crate) mod sparse;
+pub mod compression;
+pub mod encode;
+pub mod io;
+pub mod sparse;
+
+// Convenience re-exports for the HTTP path. Users composing
+// `format=Native` request bodies typically need these together.
+pub use block_info::BlockInfo;
+pub use columns::ColumnType;
+pub use encode::{ColumnSchema, encode_columns};
