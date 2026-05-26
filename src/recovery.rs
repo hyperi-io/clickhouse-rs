@@ -26,7 +26,7 @@ use crate::error::Error;
 /// not map back to the client batch position. Treat as an opaque
 /// diagnostic when the target table is Distributed. The
 /// `category` field is still meaningful (constraint vs parse).
-/// Detection of "is this Distributed?" is the caller's job today.
+/// Determine engine via [`Client::is_distributed_table`][crate::Client::is_distributed_table].
 #[must_use]
 pub fn failing_row_from_error(err: &Error) -> Option<FailureLocation> {
     let msg = match err {
