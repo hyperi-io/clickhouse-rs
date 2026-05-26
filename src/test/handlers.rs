@@ -137,6 +137,69 @@ pub fn record<T>() -> impl Handler<Control = RecordControl<T>> {
     RecordHandler(PhantomData)
 }
 
+// === record_with_uri ===
+
+/// Like [`record`] but also captures the request's URI string so
+/// tests can assert on query-string params (e.g. `log_comment=...`).
+/// Used by 11b-writer-id tests; useful elsewhere when verifying
+/// per-INSERT settings made it onto the wire.
+struct RecordWithUriHandler<T>(PhantomData<T>);
+
+impl<T> super::sealed::Sealed for RecordWithUriHandler<T> {}
+
+impl<T> super::Handler for RecordWithUriHandler<T> {
+    type Control = RecordWithUriControl<T>;
+
+    #[doc(hidden)]
+    fn make(self) -> (HandlerFn, Self::Control) {
+        let (tx, rx) = oneshot::channel();
+        let marker = PhantomData;
+        let control = RecordWithUriControl { rx, marker };
+
+        let h = Box::new(move |request: Request<Bytes>| -> Response<Bytes> {
+            let uri = request.uri().to_string();
+            let body = request.into_body();
+            let _ = tx.send((uri, body));
+            Response::new(<_>::default())
+        });
+
+        (h, control)
+    }
+}
+
+pub struct RecordWithUriControl<T> {
+    rx: oneshot::Receiver<(String, Bytes)>,
+    marker: PhantomData<T>,
+}
+
+impl<T> RecordWithUriControl<T>
+where
+    T: RowOwned + RowRead,
+{
+    /// Wait for the request and return `(uri, rows)`. `uri` is the
+    /// full request URI string (path + query); `rows` are
+    /// RowBinary-decoded.
+    pub async fn collect<C>(self) -> (String, C)
+    where
+        C: Default + Extend<T>,
+    {
+        let (uri, bytes) = self.rx.await.expect("query canceled");
+        let slice = &mut (&bytes[..]);
+        let mut rows = C::default();
+        while !slice.is_empty() {
+            let res = rowbinary::deserialize_row(slice, None);
+            let row: T = res.expect("failed to deserialize");
+            rows.extend(std::iter::once(row));
+        }
+        (uri, rows)
+    }
+}
+
+#[track_caller]
+pub fn record_with_uri<T>() -> impl Handler<Control = RecordWithUriControl<T>> {
+    RecordWithUriHandler(PhantomData)
+}
+
 // === record_ddl ===
 
 struct RecordDdlHandler;

@@ -24,7 +24,8 @@
 //! ```
 
 use std::any::Any;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::oneshot;
 use tokio::task::JoinError;
@@ -43,6 +44,38 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 8192;
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// `log_comment` setting strategy. Splits the server-side
+/// `async_insert` flush queue per writer so one writer's bad row
+/// does not poison another writer's queries
+/// ([ClickHouse#86651](https://github.com/ClickHouse/ClickHouse/issues/86651)).
+///
+/// The server queues async inserts by
+/// `(query_text, settings_hash, user)`; setting `log_comment` to a
+/// distinct value per writer changes settings_hash and segregates
+/// the queue. Setting comes through to ClickHouse as a plain
+/// query-level setting; no schema change needed server-side.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum WriterId {
+    /// Auto-generate a per-instance id (default). Format:
+    /// `clickhouse-rs:async_inserter:{nanos:x}:{seq:x}` where
+    /// `nanos` is process-time-unique and `seq` is a process-local
+    /// atomic counter -- distinct across writers in one process
+    /// AND likely-distinct across processes.
+    #[default]
+    Auto,
+    /// Explicit value provided by the caller. Useful for grouping
+    /// multiple AsyncInserter instances under one tag (e.g.
+    /// per-shard-of-app, per-tenant).
+    Custom(String),
+    /// Don't inject `log_comment`. Use only when you've set a
+    /// `log_comment` at the [`Client`] level, or you genuinely
+    /// don't want per-writer queue splitting. Concurrent writers
+    /// to a CHECK-constrained table can see false-positive errors
+    /// from `#86651` without this mitigation.
+    Disabled,
+}
+
 /// Thresholds for [`AsyncInserter`]. Defaults match ClickHouse's
 /// recommended batch sizes.
 #[derive(Debug, Clone)]
@@ -55,6 +88,10 @@ pub struct AsyncInserterConfig {
     pub max_period: Option<Duration>,
     /// MPSC capacity. Default: `8192`. Backpressure: full = producer blocks.
     pub channel_capacity: usize,
+    /// `log_comment` injection strategy. Default
+    /// [`WriterId::Auto`] mitigates async_insert flush poisoning;
+    /// see [`WriterId`] for the rationale.
+    pub writer_id: WriterId,
 }
 
 impl Default for AsyncInserterConfig {
@@ -64,6 +101,7 @@ impl Default for AsyncInserterConfig {
             max_bytes: 10 * 1024 * 1024,
             max_period: Some(Duration::from_secs(5)),
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            writer_id: WriterId::Auto,
         }
     }
 }
@@ -103,6 +141,49 @@ impl AsyncInserterConfig {
         self.channel_capacity = cap.max(1);
         self
     }
+
+    /// Use an explicit `log_comment` value for INSERTs from this
+    /// AsyncInserter. Overrides the auto-generated default. See
+    /// [`WriterId`] for the queue-splitting rationale.
+    pub fn with_writer_id(mut self, id: impl Into<String>) -> Self {
+        self.writer_id = WriterId::Custom(id.into());
+        self
+    }
+
+    /// Disable `log_comment` injection. Only do this if you've set
+    /// it at the [`Client`] level or you accept the
+    /// [#86651](https://github.com/ClickHouse/ClickHouse/issues/86651)
+    /// poisoning hazard.
+    pub fn without_writer_id(mut self) -> Self {
+        self.writer_id = WriterId::Disabled;
+        self
+    }
+}
+
+/// Resolve a [`WriterId`] to the actual `log_comment` string (if
+/// any) for this AsyncInserter instance. `None` skips injection.
+fn resolve_writer_id(id: &WriterId) -> Option<String> {
+    match id {
+        WriterId::Auto => Some(generate_auto_writer_id()),
+        WriterId::Custom(s) => Some(s.clone()),
+        WriterId::Disabled => None,
+    }
+}
+
+/// Generate `clickhouse-rs:async_inserter:{nanos:x}:{seq:x}`.
+/// `nanos`: nanoseconds since UNIX epoch (zero if unavailable).
+/// `seq`: process-local monotonic counter. Distinct across
+/// AsyncInserters in one process and likely-distinct across
+/// processes started at different times.
+#[cold]
+fn generate_auto_writer_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("clickhouse-rs:async_inserter:{nanos:x}:{seq:x}")
 }
 
 // ---------------------------------------------------------------------------
@@ -311,11 +392,20 @@ where
     /// Create an `AsyncInserter` for `table`. Spawns the background
     /// task immediately.
     pub fn new(client: &Client, table: &str, config: AsyncInserterConfig) -> Self {
+        // Resolve writer_id once at spawn time. Setting log_comment
+        // partitions the server-side async_insert flush queue per
+        // writer; see WriterId for the #86651 mitigation rationale.
+        let writer_id = resolve_writer_id(&config.writer_id);
+
         let inserter = client
             .inserter::<T>(table)
             .with_max_rows(config.max_rows)
             .with_max_bytes(config.max_bytes)
             .with_period(config.max_period);
+        let inserter = match writer_id.as_deref() {
+            Some(id) => inserter.with_setting("log_comment", id),
+            None => inserter,
+        };
 
         let channel_capacity = config.channel_capacity;
         let worker = InserterWorker {
@@ -490,5 +580,38 @@ mod setter_clamp_tests {
     fn with_channel_capacity_above_minimum_unchanged() {
         let cfg = AsyncInserterConfig::default().with_channel_capacity(16);
         assert_eq!(cfg.channel_capacity, 16);
+    }
+}
+
+#[cfg(test)]
+mod writer_id_tests {
+    use super::*;
+
+    #[test]
+    fn writer_id_auto_yields_distinct_values_across_calls() {
+        // Two back-to-back resolves of WriterId::Auto must produce
+        // different strings, even within the same nanosecond. The
+        // process-local atomic counter is what guarantees this; the
+        // nanos prefix is best-effort cross-process distinctness.
+        let a = resolve_writer_id(&WriterId::Auto).expect("Auto -> Some");
+        let b = resolve_writer_id(&WriterId::Auto).expect("Auto -> Some");
+        assert_ne!(a, b, "Auto must produce distinct ids per call: {a} == {b}");
+
+        // Format sanity: both share the documented prefix.
+        for v in [&a, &b] {
+            assert!(
+                v.starts_with("clickhouse-rs:async_inserter:"),
+                "auto id missing prefix: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_id_custom_resolves_verbatim_and_disabled_resolves_none() {
+        assert_eq!(
+            resolve_writer_id(&WriterId::Custom("shard-7".into())),
+            Some("shard-7".to_string()),
+        );
+        assert_eq!(resolve_writer_id(&WriterId::Disabled), None);
     }
 }

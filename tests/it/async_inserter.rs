@@ -179,3 +179,90 @@ async fn auto_commit_error_propagates_to_write_caller() {
     // sanely.
     let _ = inserter.end().await;
 }
+
+// ---------------------------------------------------------------------------
+// Writer-id injection (mitigates ClickHouse#86651 flush poisoning)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn writer_id_auto_injects_log_comment_query_param() {
+    // Default AsyncInserterConfig has WriterId::Auto, so every INSERT
+    // should carry a log_comment=clickhouse-rs:async_inserter:* query
+    // parameter. This is the per-writer queue-splitting mitigation for
+    // async_insert flush poisoning (https://github.com/ClickHouse/ClickHouse/issues/86651).
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_with_uri::<SimpleRow>());
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new(
+        &client,
+        "t",
+        AsyncInserterConfig::default().without_period(),
+    );
+
+    inserter.write(SimpleRow::new(1, "a")).await.unwrap();
+    inserter.flush().await.unwrap();
+    let (uri, _rows): (String, Vec<SimpleRow>) = recorder.collect().await;
+    inserter.end().await.unwrap();
+
+    assert!(
+        uri.contains("log_comment=clickhouse-rs"),
+        "auto-generated log_comment should appear in the request URI; got: {uri}"
+    );
+    assert!(
+        uri.contains("async_inserter"),
+        "auto-generated log_comment should carry the async_inserter tag; got: {uri}"
+    );
+}
+
+#[tokio::test]
+async fn writer_id_custom_value_appears_verbatim() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_with_uri::<SimpleRow>());
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new(
+        &client,
+        "t",
+        AsyncInserterConfig::default()
+            .without_period()
+            .with_writer_id("my-app/shard-7"),
+    );
+
+    inserter.write(SimpleRow::new(1, "a")).await.unwrap();
+    inserter.flush().await.unwrap();
+    let (uri, _rows): (String, Vec<SimpleRow>) = recorder.collect().await;
+    inserter.end().await.unwrap();
+
+    // URL-encoded form of "my-app/shard-7" is "my-app%2Fshard-7".
+    // Either appears -- depending on how the client encodes query params.
+    assert!(
+        uri.contains("log_comment=my-app") && uri.contains("shard-7"),
+        "custom writer_id should round-trip into log_comment param; got: {uri}"
+    );
+}
+
+#[tokio::test]
+async fn writer_id_disabled_omits_log_comment() {
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let recorder = mock.add(test::handlers::record_with_uri::<SimpleRow>());
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new(
+        &client,
+        "t",
+        AsyncInserterConfig::default()
+            .without_period()
+            .without_writer_id(),
+    );
+
+    inserter.write(SimpleRow::new(1, "a")).await.unwrap();
+    inserter.flush().await.unwrap();
+    let (uri, _rows): (String, Vec<SimpleRow>) = recorder.collect().await;
+    inserter.end().await.unwrap();
+
+    assert!(
+        !uri.contains("log_comment="),
+        "without_writer_id() should not inject log_comment; got: {uri}"
+    );
+}
