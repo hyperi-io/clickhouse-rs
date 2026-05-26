@@ -24,7 +24,10 @@
 //! ```
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::oneshot;
@@ -39,6 +42,15 @@ use crate::{
 };
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 8192;
+
+/// ClickHouse server-side `max_insert_block_size` default (24.x /
+/// 25.x). Anything larger gets split server-side into multiple
+/// blocks, each independently dedup'd -- which breaks the
+/// atomic-fail assumption used by `batch_isolation` and surprises
+/// callers expecting one block = one transaction. We warn (not
+/// error) because operators can configure a larger value
+/// server-side.
+const SERVER_MAX_INSERT_BLOCK_SIZE: u64 = 1_048_576;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -88,6 +100,16 @@ pub struct AsyncInserterConfig {
     pub max_period: Option<Duration>,
     /// MPSC capacity. Default: `8192`. Backpressure: full = producer blocks.
     pub channel_capacity: usize,
+    /// Cross-table total-bytes watermark. When the sum of pending
+    /// bytes across ALL per-table inserters exceeds this value
+    /// after a write, the worker force-flushes every table.
+    ///
+    /// `None` (default) disables. Useful for many-table writers
+    /// where individual per-table thresholds rarely trip but
+    /// aggregate memory still grows. Set to a multiple of
+    /// `max_bytes` (e.g. `Some(100 * max_bytes)`) sized to your
+    /// process's memory budget.
+    pub cross_table_max_bytes: Option<u64>,
     /// `log_comment` injection strategy. Default
     /// [`WriterId::Auto`] mitigates async_insert flush poisoning;
     /// see [`WriterId`] for the rationale.
@@ -101,6 +123,7 @@ impl Default for AsyncInserterConfig {
             max_bytes: 10 * 1024 * 1024,
             max_period: Some(Duration::from_secs(5)),
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            cross_table_max_bytes: None,
             writer_id: WriterId::Auto,
         }
     }
@@ -108,7 +131,26 @@ impl Default for AsyncInserterConfig {
 
 impl AsyncInserterConfig {
     /// Override the row-count flush threshold.
+    ///
+    /// Warns at `tracing::warn` level if `n` exceeds ClickHouse's
+    /// default `max_insert_block_size` (1,048,576). Larger values
+    /// get split server-side into multiple blocks, each
+    /// independently dedup'd -- breaking the atomic-fail assumption
+    /// in [`crate::Client::insert_batch_with_isolation`]. Operators
+    /// who've raised `max_insert_block_size` server-side can ignore
+    /// the warning.
     pub fn with_max_rows(mut self, n: u64) -> Self {
+        if n > SERVER_MAX_INSERT_BLOCK_SIZE {
+            tracing::warn!(
+                target: "clickhouse::async_inserter",
+                max_rows = n,
+                server_default = SERVER_MAX_INSERT_BLOCK_SIZE,
+                "max_rows exceeds ClickHouse's default max_insert_block_size; \
+                 inserts will be split server-side into multiple blocks, \
+                 breaking per-INSERT atomicity. Set this lower or raise \
+                 max_insert_block_size on the server."
+            );
+        }
         self.max_rows = n;
         self
     }
@@ -139,6 +181,19 @@ impl AsyncInserterConfig {
     /// normalises rather than deferring the panic to spawn time.
     pub fn with_channel_capacity(mut self, cap: usize) -> Self {
         self.channel_capacity = cap.max(1);
+        self
+    }
+
+    /// Set the cross-table total-bytes watermark. See
+    /// [`cross_table_max_bytes`][Self::cross_table_max_bytes].
+    pub fn with_cross_table_max_bytes(mut self, n: u64) -> Self {
+        self.cross_table_max_bytes = Some(n);
+        self
+    }
+
+    /// Disable the cross-table watermark (the default).
+    pub fn without_cross_table_max_bytes(mut self) -> Self {
+        self.cross_table_max_bytes = None;
         self
     }
 
@@ -186,18 +241,138 @@ fn generate_auto_writer_id() -> String {
     format!("clickhouse-rs:async_inserter:{nanos:x}:{seq:x}")
 }
 
+/// Build one [`Inserter<T>`] for `table` from `client` + `config` +
+/// optional `writer_id`. Shared by eager (single-table) construction
+/// in [`AsyncInserter::spawn_inner`] and lazy (multi-table)
+/// construction in [`InserterWorker::get_or_create`] -- keeps the
+/// builder chain drift-proof.
+fn build_inserter<T>(
+    client: &Client,
+    table: &str,
+    config: &AsyncInserterConfig,
+    writer_id: Option<&str>,
+) -> Inserter<T>
+where
+    T: RowOwned + RowWrite + Send + Sync + 'static,
+{
+    let inserter = client
+        .inserter::<T>(table)
+        .with_max_rows(config.max_rows)
+        .with_max_bytes(config.max_bytes)
+        .with_period(config.max_period);
+    match writer_id {
+        Some(id) => inserter.with_setting("log_comment", id),
+        None => inserter,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Commands sent over the MPSC channel
 // ---------------------------------------------------------------------------
 
-/// Internal command enum.
+/// Internal command enum; not part of the public API.
 pub(crate) enum AsyncInserterCommand<T> {
+    /// Write a row. `table = None` routes to the worker's default
+    /// (single-table mode); `table = Some(t)` routes to an explicit
+    /// table, creating its per-table buffer on first use. `None` on
+    /// a multi-table inserter returns
+    /// [`Error::AsyncInserterApiMisuse`]. `Arc<str>` so subsequent
+    /// writes to the same table are refcount-bumps, not allocations
+    /// -- see [`TableInterner`].
     Write {
+        table: Option<Arc<str>>,
         row: T,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Force-flush every per-table buffer; returns the summed [`Quantities`].
     Flush(oneshot::Sender<Result<Quantities>>),
+    /// End every per-table buffer; returns the summed [`Quantities`] from
+    /// the final commits.
     End(oneshot::Sender<Result<Quantities>>),
+}
+
+// ---------------------------------------------------------------------------
+// Table-name interner
+// ---------------------------------------------------------------------------
+
+/// Per-instance soft cap on cached table names. A multi-tenant
+/// ingest service receiving the table name from user input (or a
+/// broken upstream client sending a fresh name per row) can
+/// silently grow the interner unboundedly. Above the cap we log
+/// once and fall through to "allocate a fresh `Arc<str>` per
+/// call" -- correctness preserved, perf-degraded, operators see
+/// the signal.
+///
+/// 16384 is generous for a bounded-set workload (the documented
+/// `write_to` use case) and tight enough to surface
+/// pathological growth before it OOMs the process.
+const MAX_INTERNED_TABLES: usize = 16_384;
+
+/// Cache of `Arc<str>` table names. First call for a table allocates;
+/// subsequent calls return an `Arc::clone` (~5 ns refcount bump).
+/// Useful at hyperscale -- a writer fanning out 1M rows/s across
+/// even a few dozen tables otherwise allocates a fresh `String` per
+/// `write_to` for the table name.
+///
+/// Stored in `AsyncInserterHandle` so all clones share one cache.
+/// `RwLock` because the steady-state path is read-only; for very
+/// high-QPS multi-table-fan-out workloads a per-bucket lock
+/// structure (e.g. `dashmap`) is a follow-up worth benchmarking.
+pub(crate) struct TableInterner {
+    map: RwLock<HashMap<Arc<str>, ()>>,
+    /// Set to `true` once we've emitted the over-cap warning, so
+    /// the log line fires once per inserter rather than per write.
+    cap_warned: AtomicBool,
+}
+
+impl TableInterner {
+    fn new() -> Self {
+        Self {
+            map: RwLock::new(HashMap::new()),
+            cap_warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Get-or-insert the `Arc<str>` for `key`. Returns a clone of
+    /// the canonical entry, or -- if the per-inserter cap is
+    /// already saturated and `key` is new -- a fresh allocation
+    /// bypassing the cache (and a one-shot warning).
+    fn intern(&self, key: &str) -> Arc<str> {
+        // Hot path: read lock + Arc::clone.
+        if let Some(arc) = self
+            .map
+            .read()
+            .expect("interner read poisoned")
+            .get_key_value(key)
+            .map(|(k, _)| Arc::clone(k))
+        {
+            return arc;
+        }
+        // Slow path: insert. Re-check under the write lock in case
+        // another caller raced us between read-drop and write-acquire.
+        let mut map = self.map.write().expect("interner write poisoned");
+        if let Some(arc) = map.get_key_value(key).map(|(k, _)| Arc::clone(k)) {
+            return arc;
+        }
+        if map.len() >= MAX_INTERNED_TABLES {
+            // Surface the signal once per interner lifetime.
+            if !self.cap_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "clickhouse::async_inserter",
+                    cached_tables = map.len(),
+                    cap = MAX_INTERNED_TABLES,
+                    "table-name interner reached its soft cap; \
+                     subsequent unique table names allocate a fresh \
+                     Arc per write. Check for unbounded table-name \
+                     input (per-row uniqueness suggests a caller bug)."
+                );
+            }
+            return Arc::from(key);
+        }
+        let arc: Arc<str> = Arc::from(key);
+        map.insert(Arc::clone(&arc), ());
+        arc
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,12 +380,108 @@ pub(crate) enum AsyncInserterCommand<T> {
 // ---------------------------------------------------------------------------
 
 struct InserterWorker<T> {
-    /// `Option` so `End` / `on_shutdown` can `take` for the consuming
-    /// `Inserter::end()`. Once `None`, subsequent commands are no-ops.
-    inserter: Option<Inserter<T>>,
-    /// Held so `idle_interval` can read the period; `Inserter<T>`
-    /// stores its own copy but doesn't expose it.
+    /// Used by `get_or_create` for lazy per-table construction.
+    client: Client,
     config: AsyncInserterConfig,
+    /// `Some` for single-table mode (routes `Write` commands here);
+    /// `None` for multi-table (rejects `Write`, accepts `WriteTo`).
+    /// `Arc<str>` so the per-`Write` clone is a refcount bump.
+    default_table: Option<Arc<str>>,
+    /// Resolved `log_comment` value, derived once at spawn time from
+    /// [`WriterId`]. `None` means "don't inject"; same value
+    /// re-applied to every per-table Inserter so they all share the
+    /// same server-side flush queue partition.
+    writer_id: Option<String>,
+    /// Eager entry for single-table; lazy insert on first `WriteTo`.
+    /// `BTreeMap` so iteration order is deterministic across runs --
+    /// `Flush` / `End` visit tables in lexicographic order, which makes
+    /// failure-attribution and test recording stable. Cost vs `HashMap`
+    /// is one O(log N) compare per `WriteTo`; N is the per-AsyncInserter
+    /// table count (typically <10), so the log-factor is negligible.
+    /// Key is `Arc<str>` so the BTreeMap entry shares the same arc the
+    /// handle-side interner produces -- no second allocation per write.
+    inserters: BTreeMap<Arc<str>, Inserter<T>>,
+    /// Set after `End`. Subsequent commands return safe defaults.
+    ended: bool,
+}
+
+impl<T> InserterWorker<T>
+where
+    T: RowOwned + RowWrite + Send + Sync + 'static,
+{
+    /// Get-or-create the inserter for `table`. Uses `BTreeMap::entry`
+    /// for a single lookup on the hot path. The build chain is
+    /// inlined (rather than calling a `&self` helper) because the
+    /// `entry()` borrow of `self.inserters` would otherwise conflict
+    /// with `&self` -- the alternative (contains_key + insert + get_mut)
+    /// is three lookups per call. Same chain runs eagerly in
+    /// [`AsyncInserter::spawn_inner`] for single-table mode.
+    ///
+    /// `table` is an `Arc<str>` from the handle's interner; the
+    /// `entry(table.clone())` does an `Arc::clone` (~5 ns refcount
+    /// bump) for fresh entries and zero allocation thereafter.
+    fn get_or_create(&mut self, table: Arc<str>) -> &mut Inserter<T> {
+        let client = &self.client;
+        let config = &self.config;
+        let writer_id = self.writer_id.as_deref();
+        let table_str: &str = &table;
+        self.inserters
+            .entry(Arc::clone(&table))
+            .or_insert_with(|| build_inserter(client, table_str, config, writer_id))
+    }
+
+    /// Write one row + run threshold-triggered auto-commit. Propagates
+    /// serialise AND auto-commit errors (architecture.md section 11).
+    ///
+    /// After the per-table commit, if the cross-table watermark
+    /// is configured AND the sum of pending bytes across ALL
+    /// inserters exceeds it, force-flush every table.
+    async fn write_one(&mut self, table: Arc<str>, row: &T) -> Result<()> {
+        {
+            let inserter = self.get_or_create(table);
+            inserter.write(row).await?;
+            inserter.commit().await?;
+        }
+
+        if let Some(threshold) = self.config.cross_table_max_bytes {
+            let total: u64 = self
+                .inserters
+                .values()
+                .map(|i| i.pending().bytes)
+                .sum();
+            if total >= threshold {
+                tracing::debug!(
+                    target: "clickhouse::async_inserter",
+                    total_pending_bytes = total,
+                    threshold = threshold,
+                    "cross-table watermark tripped; force-flushing all tables"
+                );
+                self.force_commit_all().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Force-commit every per-table inserter. Used by the
+    /// cross-table watermark check in [`write_one`][Self::write_one].
+    /// Stops on the first per-table error.
+    async fn force_commit_all(&mut self) -> Result<()> {
+        for inserter in self.inserters.values_mut() {
+            inserter.force_commit().await?;
+        }
+        Ok(())
+    }
+
+    /// Consume every per-table inserter so each one's consuming
+    /// [`Inserter::end()`] can run. Used by `End` and `on_shutdown`.
+    /// The intermediate `Vec` is forced because we need to await
+    /// each `end()` and a borrowed `BTreeMap` iter can't be held
+    /// across `.await`.
+    fn drain_inserters(&mut self) -> Vec<Inserter<T>> {
+        std::mem::take(&mut self.inserters)
+            .into_values()
+            .collect()
+    }
 }
 
 impl<T> CommandWorker for InserterWorker<T>
@@ -228,66 +499,98 @@ where
     }
 
     async fn handle(&mut self, cmd: Self::Command) {
-        let Some(inserter) = self.inserter.as_mut() else {
-            // Already ended; subsequent commands no-op or report closed.
+        if self.ended {
+            // Post-End: inserters consumed; reply with safe defaults so
+            // callers don't hang while we wait for shutdown.
             match cmd {
                 AsyncInserterCommand::Write { reply, .. } => {
                     let _ = reply.send(Err(Error::WorkerExited));
                 }
-                AsyncInserterCommand::Flush(resp) => {
-                    let _ = resp.send(Ok(Quantities::ZERO));
-                }
-                AsyncInserterCommand::End(resp) => {
-                    let _ = resp.send(Ok(Quantities::ZERO));
+                AsyncInserterCommand::Flush(reply) | AsyncInserterCommand::End(reply) => {
+                    let _ = reply.send(Ok(Quantities::ZERO));
                 }
             }
             return;
-        };
+        }
 
         match cmd {
-            AsyncInserterCommand::Write { row, reply } => {
-                // Propagate both serialise AND threshold-triggered commit
-                // errors. Without this, a max_rows commit failure during
-                // write would return Ok to the caller while the buffered
-                // rows had been discarded by Insert::abort() -- silently
-                // losing the rows.
-                let result = match inserter.write(&row).await {
-                    Ok(()) => inserter.commit().await.map(|_| ()),
-                    Err(e) => Err(e),
+            AsyncInserterCommand::Write { table, row, reply } => {
+                // Resolve explicit `Some(table)` first, fall back to
+                // the worker's default. No default + no explicit table
+                // = caller used the wrong API. Both sides are
+                // `Arc<str>` -- no per-write allocation.
+                let resolved: Option<Arc<str>> = table.or_else(|| self.default_table.clone());
+                let Some(table) = resolved else {
+                    let _ = reply.send(Err(Error::AsyncInserterApiMisuse {
+                        method: "write",
+                        hint: "use write_to(table, row) on a multi-table inserter",
+                    }));
+                    return;
                 };
-                let _ = reply.send(result);
+                let _ = reply.send(self.write_one(table, &row).await);
             }
-            AsyncInserterCommand::Flush(resp) => {
-                let _ = resp.send(inserter.force_commit().await);
+            AsyncInserterCommand::Flush(reply) => {
+                // All-or-nothing across tables (architecture.md 11.1 P4).
+                // First failure aborts; not-yet-flushed tables keep
+                // their buffers; already-flushed tables are in CH
+                // (replay relies on server-side dedup -- 11.2).
+                let mut total = Quantities::ZERO;
+                for inserter in self.inserters.values_mut() {
+                    match inserter.force_commit().await {
+                        Ok(q) => {
+                            total.bytes = total.bytes.saturating_add(q.bytes);
+                            total.rows = total.rows.saturating_add(q.rows);
+                            total.transactions =
+                                total.transactions.saturating_add(q.transactions);
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                            return;
+                        }
+                    }
+                }
+                let _ = reply.send(Ok(total));
             }
-            AsyncInserterCommand::End(resp) => {
-                // Take out the inserter so the consuming end() can run.
-                // After this, self.inserter is None and the worker is
-                // effectively done; the runner will exit when shutdown
-                // is signalled.
-                // The runner serialises commands and the `End` arm is the
-                // last one to run before shutdown, so `self.inserter` is
-                // always `Some` here. The runner exits after this match
-                // anyway; the second `End` would be a programmer error.
-                let Some(inserter) = self.inserter.take() else {
-                    unreachable!("End reached after the inserter was already consumed");
-                };
-                let _ = resp.send(inserter.end().await);
+            AsyncInserterCommand::End(reply) => {
+                let mut total = Quantities::ZERO;
+                let mut last_err: Option<Error> = None;
+                for inserter in self.drain_inserters() {
+                    match inserter.end().await {
+                        Ok(q) => {
+                            total.bytes = total.bytes.saturating_add(q.bytes);
+                            total.rows = total.rows.saturating_add(q.rows);
+                            total.transactions =
+                                total.transactions.saturating_add(q.transactions);
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                self.ended = true;
+                let _ = reply.send(last_err.map_or(Ok(total), Err));
             }
         }
     }
 
     async fn on_idle(&mut self) {
-        if let Some(inserter) = self.inserter.as_mut() {
-            // commit() runs the threshold check; idle on a quiet worker is a no-op.
+        if self.ended {
+            return;
+        }
+        // commit() runs the threshold check; idle on a quiet worker is a no-op.
+        for inserter in self.inserters.values_mut() {
             let _ = inserter.commit().await;
         }
     }
 
     async fn on_shutdown(&mut self) {
-        if let Some(inserter) = self.inserter.take() {
+        if self.ended {
+            return;
+        }
+        // Worker's final cleanup: drain each inserter; errors dropped
+        // (no caller to receive them).
+        for inserter in self.drain_inserters() {
             let _ = inserter.end().await;
         }
+        self.ended = true;
     }
 }
 
@@ -351,6 +654,10 @@ where
     T: RowOwned + RowWrite + Send + Sync + 'static,
 {
     handle: WorkerHandle<AsyncInserterCommand<T>>,
+    /// Shared table-name interner. All clones reference the same
+    /// `TableInterner` so a repeated `write_to("orders", ...)` from
+    /// any handle hits the cache after the first call.
+    interner: Arc<TableInterner>,
 }
 
 // Manual Clone: derive would add a spurious `T: Clone` bound, but
@@ -362,6 +669,7 @@ where
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
+            interner: Arc::clone(&self.interner),
         }
     }
 }
@@ -389,34 +697,70 @@ impl<T> AsyncInserter<T>
 where
     T: RowOwned + RowWrite + Send + Sync + 'static,
 {
-    /// Create an `AsyncInserter` for `table`. Spawns the background
-    /// task immediately.
+    /// Single-table `AsyncInserter` for `table`. Spawns the background
+    /// task immediately. [`write`][Self::write] routes to `table`;
+    /// [`write_to`][Self::write_to] still works with other tables (a
+    /// per-table buffer is created on first use).
     pub fn new(client: &Client, table: &str, config: AsyncInserterConfig) -> Self {
-        // Resolve writer_id once at spawn time. Setting log_comment
-        // partitions the server-side async_insert flush queue per
-        // writer; see WriterId for the #86651 mitigation rationale.
+        Self::spawn_inner(client, Some(Arc::from(table)), config)
+    }
+
+    /// Multi-table `AsyncInserter`. No default table; callers must use
+    /// [`write_to`][Self::write_to]. Per-table buffers share thresholds
+    /// and a single background task (one period tick coordinates
+    /// flushes across all tables). [`write`][Self::write] returns an
+    /// error in this mode.
+    pub fn new_multi_table(client: &Client, config: AsyncInserterConfig) -> Self {
+        Self::spawn_inner(client, None, config)
+    }
+
+    fn spawn_inner(
+        client: &Client,
+        default_table: Option<Arc<str>>,
+        config: AsyncInserterConfig,
+    ) -> Self {
+        // Resolve writer_id once at spawn time. All per-table
+        // inserters share the same value so the server-side flush
+        // queue gets partitioned per AsyncInserter instance (not per
+        // table), which is the right granularity for #86651
+        // mitigation.
         let writer_id = resolve_writer_id(&config.writer_id);
 
-        let inserter = client
-            .inserter::<T>(table)
-            .with_max_rows(config.max_rows)
-            .with_max_bytes(config.max_bytes)
-            .with_period(config.max_period);
-        let inserter = match writer_id.as_deref() {
-            Some(id) => inserter.with_setting("log_comment", id),
-            None => inserter,
-        };
+        let mut inserters: BTreeMap<Arc<str>, Inserter<T>> = BTreeMap::new();
+        if let Some(table) = default_table.as_ref() {
+            // Eager construction for single-table mode (inserter ready
+            // before any write). Shares the build chain with
+            // [`InserterWorker::get_or_create`] via `build_inserter`.
+            let inserter = build_inserter(client, table.as_ref(), &config, writer_id.as_deref());
+            inserters.insert(Arc::clone(table), inserter);
+        }
+
+        // Pre-warm the interner with the default table (if any) so
+        // the single-table fast path resolves through it without a
+        // second alloc. For multi-table mode, the interner starts
+        // empty.
+        let interner = Arc::new(TableInterner::new());
+        if let Some(default) = default_table.as_ref() {
+            let _ = interner.intern(default.as_ref());
+        }
 
         let channel_capacity = config.channel_capacity;
         let worker = InserterWorker {
-            inserter: Some(inserter),
-            config,
+            client: client.clone(),
+            config: config.clone(),
+            default_table,
+            writer_id,
+            inserters,
+            ended: false,
         };
 
         let control = worker::spawn(worker, channel_capacity);
         let handle = control.handle();
         Self {
-            inner: AsyncInserterHandle { handle },
+            inner: AsyncInserterHandle {
+                handle,
+                interner,
+            },
             control: Some(control),
         }
     }
@@ -431,7 +775,14 @@ where
         self.inner.write(row).await
     }
 
-    /// Force-flush buffered rows. See [`AsyncInserterHandle::flush`].
+    /// Serialise + buffer a row for `table`. See
+    /// [`AsyncInserterHandle::write_to`].
+    pub async fn write_to(&self, table: &str, row: T) -> Result<()> {
+        self.inner.write_to(table, row).await
+    }
+
+    /// Force-flush every per-table buffer. See
+    /// [`AsyncInserterHandle::flush`].
     pub async fn flush(&self) -> Result<Quantities> {
         self.inner.flush().await
     }
@@ -445,6 +796,12 @@ where
     /// completes.
     ///
     /// # Failure semantics
+    ///
+    /// Best-effort across tables (unlike [`flush`][Self::flush]).
+    /// Every per-table end is attempted; `Quantities` sums successes;
+    /// last error is surfaced. No replay path past end -- partial
+    /// loss is the cost of graceful shutdown (the alternative loses
+    /// MORE rows).
     ///
     /// If the End command succeeds but the background task itself
     /// panicked, the panic message is surfaced as [`Error::Custom`].
@@ -537,18 +894,64 @@ where
     /// was buffered successfully; retry policy is the caller's
     /// (architecture.md section 11.5).
     pub async fn write(&self, row: T) -> Result<()> {
-        self.send_cmd(|reply| AsyncInserterCommand::Write { row, reply })
-            .await
+        self.send_cmd(|reply| AsyncInserterCommand::Write {
+            table: None,
+            row,
+            reply,
+        })
+        .await
     }
 
-    /// Force-flush buffered rows, returning committed [`Quantities`].
-    /// Empty buffer = zero.
+    /// Serialise + buffer a row for `table`. Creates a per-table
+    /// buffer on first sight. Works in single-table or multi-table
+    /// mode (fan-in across schema-compatible tables).
+    ///
+    /// # Caveats
+    ///
+    /// `write_to` is intended for a **bounded set of tables** known
+    /// in advance (e.g. dozens, not millions). The internal name
+    /// interner caches every distinct `table` argument as an
+    /// `Arc<str>` for the lifetime of the [`AsyncInserter`]; passing
+    /// a fresh table name per row grows the interner unboundedly.
+    /// Callers driving high-cardinality table fan-out should
+    /// memoise or pre-canonicalise their names externally.
     ///
     /// # Errors
     ///
-    /// Flush error (HTTP 4xx/5xx, schema mismatch, etc.). Caller
-    /// drives retry; the library does not preserve row buffers across
-    /// transport failures (architecture.md section 11.5).
+    /// Same as [`write`][Self::write]: serialisation + auto-commit
+    /// errors propagate through the `Result`.
+    pub async fn write_to(&self, table: &str, row: T) -> Result<()> {
+        // First call for this table allocates the Arc<str>; every
+        // subsequent call is an Arc::clone refcount bump.
+        let table = Some(self.interner.intern(table));
+        self.send_cmd(|reply| AsyncInserterCommand::Write { table, row, reply })
+            .await
+    }
+
+    /// Force-flush every per-table buffer; returns summed
+    /// [`Quantities`] (zero per empty buffer).
+    ///
+    /// # Failure semantics
+    ///
+    /// All-or-nothing across tables. First per-table failure aborts
+    /// the rest; caller gets the error without summed `Quantities`.
+    /// Pre-failure tables have already committed; post-failure tables
+    /// keep their buffers for retry. Tables are visited in
+    /// lexicographic order (`BTreeMap` iteration), so failure
+    /// attribution is stable across runs.
+    ///
+    /// At-least-once replay needs server-side block-level dedup.
+    /// `ReplicatedMergeTree` has this by default
+    /// (`replicated_deduplication_window=100`); for non-replicated,
+    /// set `insert_deduplicate=1`. See architecture.md sections
+    /// 11.1 P4 and 11.2.
+    ///
+    /// # Errors
+    ///
+    /// First per-table flush error (HTTP 4xx/5xx, schema mismatch,
+    /// etc.). Caller drives retry; the library does not preserve
+    /// row buffers across transport failures
+    /// (architecture.md section 11.5).
     pub async fn flush(&self) -> Result<Quantities> {
         self.send_cmd(AsyncInserterCommand::Flush).await
     }
@@ -613,5 +1016,73 @@ mod writer_id_tests {
             Some("shard-7".to_string()),
         );
         assert_eq!(resolve_writer_id(&WriterId::Disabled), None);
+    }
+}
+
+#[cfg(test)]
+mod interner_tests {
+    use super::*;
+
+    #[test]
+    fn intern_returns_same_arc_for_same_key() {
+        let interner = TableInterner::new();
+        let a = interner.intern("orders");
+        let b = interner.intern("orders");
+        // Both Arc instances must point to the same allocation.
+        assert!(Arc::ptr_eq(&a, &b), "repeat intern of same key should share alloc");
+        assert_eq!(a.as_ref(), "orders");
+    }
+
+    #[test]
+    fn intern_separates_distinct_keys() {
+        let interner = TableInterner::new();
+        let a = interner.intern("orders");
+        let b = interner.intern("events");
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(a.as_ref(), "orders");
+        assert_eq!(b.as_ref(), "events");
+    }
+
+    #[test]
+    fn intern_refcount_bumps_on_cache_hit() {
+        let interner = TableInterner::new();
+        let first = interner.intern("orders");
+        let strong_after_first = Arc::strong_count(&first);
+        let _second = interner.intern("orders");
+        let _third = interner.intern("orders");
+        let strong_after_three = Arc::strong_count(&first);
+        // Two more clones in the wild (+ 1 inside the interner's
+        // HashMap key) means strong count rose by exactly the new
+        // observations.
+        assert_eq!(strong_after_three, strong_after_first + 2);
+    }
+
+    #[test]
+    fn intern_is_thread_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let interner = Arc::new(TableInterner::new());
+        let mut handles = vec![];
+        for i in 0..8 {
+            let interner = Arc::clone(&interner);
+            handles.push(thread::spawn(move || {
+                // 4 threads intern "shared", 4 intern unique keys.
+                if i < 4 {
+                    interner.intern("shared")
+                } else {
+                    interner.intern(&format!("unique_{i}"))
+                }
+            }));
+        }
+        let arcs: Vec<Arc<str>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // All four "shared" arcs are pointer-equal.
+        for window in arcs[..4].windows(2) {
+            assert!(Arc::ptr_eq(&window[0], &window[1]));
+        }
+        // Unique keys are NOT pointer-equal to shared.
+        for unique in &arcs[4..] {
+            assert!(!Arc::ptr_eq(&arcs[0], unique));
+        }
     }
 }

@@ -42,6 +42,15 @@ pub enum Error {
     /// don't retry the same handle.
     #[error("background worker task has exited; the inserter is no longer accepting commands")]
     WorkerExited,
+    /// AsyncInserter state-machine misuse from the caller.
+    /// Example: calling `write` (default-table form) on an inserter
+    /// constructed via `new_multi_table`. `method` is the API the
+    /// caller invoked; `hint` is the corrective action.
+    #[error("AsyncInserter API misuse: `{method}` -- {hint}")]
+    AsyncInserterApiMisuse {
+        method: &'static str,
+        hint: &'static str,
+    },
     #[error("bad response: {0}")]
     BadResponse(String),
     #[error("timeout expired")]
@@ -135,6 +144,7 @@ impl Error {
             Error::VariantDiscriminatorIsOutOfBound(_) => "VariantDiscriminatorIsOutOfBound",
             Error::Custom(_) => "Custom",
             Error::WorkerExited => "WorkerExited",
+            Error::AsyncInserterApiMisuse { .. } => "AsyncInserterApiMisuse",
             Error::BadResponse(_) => "BadResponse",
             Error::TimedOut => "TimedOut",
             Error::InvalidColumnsHeader(_) => "InvalidColumnsHeader",

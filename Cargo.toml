@@ -65,6 +65,11 @@ name = "async_inserter"
 harness = false
 required-features = ["inserter", "test-util"]
 
+[[bench]]
+name = "async_inserter_multi_table"
+harness = false
+required-features = ["inserter", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]
