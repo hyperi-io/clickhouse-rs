@@ -15,6 +15,7 @@ use clickhouse_types::{Column, DataTypeNode};
 
 use crate::error::Error;
 use std::collections::HashSet;
+use std::time::Duration;
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -54,6 +55,15 @@ mod row_metadata;
 mod rowbinary;
 #[cfg(feature = "inserter")]
 mod ticks;
+// Shared TLS trust (HTTP + TCP). Gated to whenever any rustls path is
+// active; the `native-tls-rustls` arm matches downstream where it is
+// defined.
+#[cfg(any(
+    feature = "rustls-tls-aws-lc",
+    feature = "rustls-tls-ring",
+    feature = "native-tls-rustls"
+))]
+pub(crate) mod tls;
 
 /// A client containing HTTP pool.
 ///
@@ -95,6 +105,30 @@ pub struct Client {
     /// that issues `KILL QUERY` for the still-in-flight query.
     /// Opt in via [`with_kill_on_drop`][Self::with_kill_on_drop].
     kill_on_drop: bool,
+
+    /// Pool configuration baked into `self.http`. Stored so
+    /// `with_pool_*` builder methods can rebuild the http client
+    /// with the updated value. `Default::default()` matches the
+    /// hardcoded behaviour of prior versions
+    /// (idle_timeout=2s, no per-host cap, keepalive=60s).
+    pool_config: http_client::PoolConfig,
+
+    /// Declarative or explicit TLS trust source (None = default
+    /// per-transport behaviour, happy path untouched).
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    tls_source: Option<tls::TlsConfigSource>,
+    /// Cached resolved config, kept in sync with `tls_source` by the
+    /// TLS builder methods so non-TLS rebuilds reuse it infallibly.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    tls_resolved: Option<std::sync::Arc<rustls::ClientConfig>>,
 
     #[cfg(feature = "test-util")]
     mocked: bool,
@@ -143,6 +177,70 @@ impl Default for Client {
 #[derive(Default)]
 pub(crate) struct InsertMetadataCache(RwLock<HashMap<String, Arc<InsertMetadata>>>);
 
+/// Durability mode for INSERTs into Distributed-engine tables.
+///
+/// Distributed targets fan out writes from a coordinator node to
+/// shard nodes. The default mode acks the client as soon as the
+/// coordinator has buffered the data locally; if the coordinator
+/// crashes before forwarding, data is lost. The other two modes
+/// trade throughput for stronger durability.
+///
+/// Maps to ClickHouse session settings. No effect on non-Distributed
+/// tables (the settings simply do nothing).
+///
+/// Background on the coordinator-crash window:
+/// [ClickHouse#17380](https://github.com/ClickHouse/ClickHouse/issues/17380).
+///
+/// # Interaction with `Query::async_insert` and dedup tokens
+///
+/// `Durability`, `Query::async_insert(wait)`, and
+/// `Client::insert_batch_with_isolation_with_token` are three
+/// independent durability dimensions and combine sensibly:
+///
+/// | Durability         | async_insert(true)         | async_insert(false)        | dedup-token retry         |
+/// |--------------------|----------------------------|----------------------------|---------------------------|
+/// | Background         | server queues; client waits | server queues; fire-and-forget | safe (caller retries on transport failure) |
+/// | Foreground         | server queues; client waits for shard ack | server queues; client returns when queued | shard-local dedup; non-Replicated under Distributed gives no cross-shard safety |
+/// | ForegroundFsynced  | as Foreground + fsync gate | as Foreground + fsync gate | as Foreground |
+///
+/// The combinations are not mutually exclusive; CH evaluates the
+/// settings independently. Caveats worth knowing:
+///
+/// - `async_insert(false)` with `Foreground` puts the fsync inside
+///   the async-flush worker on the server, NOT on the request path
+///   (the request returns once the row is queued for flush). This
+///   weakens the durability guarantee from "data is on disk before
+///   ack" to "data is queued for the flush worker before ack".
+/// - Dedup tokens forwarded by Distributed tables get evaluated
+///   per-shard; non-Replicated MergeTree under Distributed gives
+///   no cross-node dedup. Replicated*MergeTree is required for
+///   retry-safe at-least-once with dedup tokens under Distributed.
+/// - Combining Durability + dedup tokens does not require
+///   `async_insert`; the three layer cleanly.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub enum Durability {
+    /// Coordinator acks the client as soon as data is buffered on
+    /// its local disk; forwards to shards lazily. Highest throughput;
+    /// crash window between ack and shard delivery loses data.
+    /// Default: matches CH server's default
+    /// (`distributed_foreground_insert=0`).
+    #[default]
+    Background,
+    /// Coordinator blocks the ack until shards have received the
+    /// data. No crash window for delivery. Throughput cost depends
+    /// on shard count and network latency.
+    /// Maps to `distributed_foreground_insert=1`.
+    Foreground,
+    /// Foreground + fsync at both the file and directory level on
+    /// the coordinator. Maximum durability available; for use when
+    /// the coordinator's local disk is a real durability boundary
+    /// (typically NVMe with battery-backed write cache).
+    /// Maps to `distributed_foreground_insert=1,
+    /// fsync_after_insert=1, fsync_directories=1`.
+    ForegroundFsynced,
+}
+
 impl Client {
     /// Creates a new client with a specified underlying HTTP client.
     ///
@@ -164,9 +262,99 @@ impl Client {
             #[cfg(feature = "uuid")]
             auto_query_id: false,
             kill_on_drop: false,
+            pool_config: http_client::PoolConfig::default(),
+            #[cfg(any(
+                feature = "rustls-tls-aws-lc",
+                feature = "rustls-tls-ring",
+                feature = "native-tls-rustls"
+            ))]
+            tls_source: None,
+            #[cfg(any(
+                feature = "rustls-tls-aws-lc",
+                feature = "rustls-tls-ring",
+                feature = "native-tls-rustls"
+            ))]
+            tls_resolved: None,
             #[cfg(feature = "test-util")]
             mocked: false,
         }
+    }
+
+    /// Idle-connection timeout for the default HTTP client's pool.
+    /// Default: 2 seconds (matches ClickHouse server's keep-alive
+    /// default). For steady-state high-throughput ingest, raise this
+    /// (e.g. 30 s) so the pool doesn't churn connections between
+    /// bursts.
+    ///
+    /// **Constructor-time only.** Rebuilds the underlying HTTP
+    /// client. Call before issuing any requests; calling mid-flight
+    /// drops `self.http`'s `Arc` but in-flight requests keep their
+    /// own handle, so two pools run in parallel until the in-flight
+    /// requests drain. Repeated mid-flight calls (e.g. from a
+    /// config-watcher) compound this. No effect if the client was
+    /// constructed via
+    /// [`with_http_client`][Self::with_http_client] (caller-supplied
+    /// HTTP clients aren't rebuilt).
+    pub fn with_pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.pool_config.idle_timeout = d;
+        self.rebuild_http_client();
+        self
+    }
+
+    /// Maximum number of idle pooled connections per host. Default
+    /// (unset) lets hyper use its built-in default (currently
+    /// unbounded). `clickhouse-go` defaults to 5; raise based on
+    /// concurrent-query peak per host.
+    ///
+    /// Rebuilds the underlying HTTP client. See
+    /// [`with_pool_idle_timeout`][Self::with_pool_idle_timeout] for
+    /// the rebuild caveat.
+    pub fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.pool_config.max_idle_per_host = Some(n);
+        self.rebuild_http_client();
+        self
+    }
+
+    /// TCP keep-alive interval for outbound connections. Default:
+    /// 60 s. Drives the OS-level KEEPALIVE probes; orthogonal to
+    /// the pool's idle-timeout (which evicts conns the client
+    /// hasn't reused). Rebuilds the HTTP client.
+    pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
+        self.pool_config.tcp_keepalive = d;
+        self.rebuild_http_client();
+        self
+    }
+
+    /// Resolve the TLS config for an HTTP-client rebuild, fail-closed.
+    ///
+    /// When a trust was configured (`tls_source` is Some) but did not
+    /// resolve (`tls_resolved` is None), return an empty-roots config
+    /// that rejects every handshake -- never the default webpki path
+    /// (broad trust). Used by EVERY http rebuild so a non-TLS rebuild
+    /// (e.g. `with_pool_idle_timeout`) can't silently revert a
+    /// configured-but-unresolved trust to fail-open.
+    #[cfg(any(feature = "rustls-tls-aws-lc", feature = "rustls-tls-ring"))]
+    fn http_tls_config(&self) -> Option<std::sync::Arc<rustls::ClientConfig>> {
+        match (&self.tls_source, &self.tls_resolved) {
+            #[cfg(not(feature = "native-tls"))]
+            (Some(_), None) => Some(tls::build_failclosed_config()),
+            (_, resolved) => resolved.clone(),
+        }
+    }
+
+    fn rebuild_http_client(&mut self) {
+        // Only meaningful when using the default HTTP client; a
+        // caller-supplied implementation has its own pool config.
+        // We can't distinguish at runtime which case we're in -- if
+        // the caller passed a custom HttpClient via `with_http_client`,
+        // this rebuild silently replaces it with the default. Callers
+        // mixing `with_http_client` + `with_pool_*` should treat the
+        // last call as authoritative.
+        self.http = Arc::new(http_client::with_pool_config(
+            self.pool_config.clone(),
+            #[cfg(any(feature = "rustls-tls-aws-lc", feature = "rustls-tls-ring"))]
+            self.http_tls_config(),
+        ));
     }
 
     /// Specifies ClickHouse's url. Should point to HTTP endpoint.
@@ -345,6 +533,164 @@ impl Client {
         self.compression = compression;
         self
     }
+
+    /// Provide a fully-built rustls `ClientConfig` used for BOTH the
+    /// HTTP and TCP transports (the rustls analog of clickhouse-go's
+    /// `Options.TLS`). Overrides any accumulated `with_tls_*` trust.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    pub fn with_tls_config(mut self, config: rustls::ClientConfig) -> Self {
+        let arc = std::sync::Arc::new(config);
+        self.tls_source = Some(tls::TlsConfigSource::Explicit(arc.clone()));
+        self.tls_resolved = Some(arc);
+        self.rebuild_http_for_tls();
+        self
+    }
+
+    /// Toggle OS native-root trust (default on once any with_tls_* is
+    /// used). Applies to whichever transport the client uses.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    pub fn with_tls_native_roots(mut self, enabled: bool) -> Self {
+        self.mutate_trust(|t| t.native_roots = enabled);
+        self
+    }
+
+    /// Toggle the compiled-in webpki bundle.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    pub fn with_tls_webpki_roots(mut self, enabled: bool) -> Self {
+        self.mutate_trust(|t| t.webpki_roots = enabled);
+        self
+    }
+
+    /// Trust ONLY the explicit CA files; ignore native + webpki.
+    /// Requires at least one `try_with_tls_root_ca` / intermediate.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    pub fn with_tls_roots_exclusive(mut self) -> Self {
+        self.mutate_trust(|t| t.exclusive = true);
+        self
+    }
+
+    /// Add a root CA PEM file (may bundle many certs; all are loaded).
+    /// Fallible: reads the file now to surface bad paths / empty files.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    pub fn try_with_tls_root_ca(mut self, pem_path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let p = pem_path.as_ref().to_path_buf();
+        self.try_mutate_trust(|t| t.extra_roots.push(p))?;
+        Ok(self)
+    }
+
+    /// Add an intermediate CA PEM file (added as anchors too, for
+    /// servers that do not present their chain / multi-tier PKI).
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    pub fn try_with_tls_intermediate_certs(
+        mut self,
+        pem_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let p = pem_path.as_ref().to_path_buf();
+        self.try_mutate_trust(|t| t.extra_intermediates.push(p))?;
+        Ok(self)
+    }
+
+    // --- internal TLS helpers ---
+
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    fn current_trust(&self) -> tls::TlsTrust {
+        match &self.tls_source {
+            Some(tls::TlsConfigSource::Trust(t)) => t.clone(),
+            _ => tls::TlsTrust::default(),
+        }
+    }
+
+    /// Infallible flag mutation. Re-resolves and records the resolve
+    /// OUTCOME: on a resolve error `tls_resolved` becomes None while
+    /// `tls_source` still records the configured intent. Fail-closed --
+    /// transports MUST NOT fall back to default/broad trust when a trust
+    /// was configured (tls_source is Some) -- see the build sites.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    fn mutate_trust(&mut self, f: impl FnOnce(&mut tls::TlsTrust)) {
+        let mut trust = self.current_trust();
+        f(&mut trust);
+        let src = tls::TlsConfigSource::Trust(trust);
+        self.tls_resolved = tls::build_client_config(&src).ok();
+        self.tls_source = Some(src);
+        self.rebuild_http_for_tls();
+    }
+
+    /// Fallible mutation (reads CA files). Surfaces resolve errors.
+    #[cfg(any(
+        feature = "rustls-tls-aws-lc",
+        feature = "rustls-tls-ring",
+        feature = "native-tls-rustls"
+    ))]
+    fn try_mutate_trust(&mut self, f: impl FnOnce(&mut tls::TlsTrust)) -> Result<()> {
+        let mut trust = self.current_trust();
+        f(&mut trust);
+        let src = tls::TlsConfigSource::Trust(trust);
+        let cfg = tls::build_client_config(&src)?;
+        self.tls_resolved = Some(cfg);
+        self.tls_source = Some(src);
+        self.rebuild_http_for_tls();
+        Ok(())
+    }
+
+    /// Rebuild the HTTP client so a TLS change takes effect on the HTTP
+    /// transport. (TCP reads tls_resolved at pool-build time.)
+    #[cfg(all(
+        any(feature = "rustls-tls-aws-lc", feature = "rustls-tls-ring"),
+        not(feature = "native-tls")
+    ))]
+    fn rebuild_http_for_tls(&mut self) {
+        // Shares the single fail-closed-aware rebuild path so a TLS
+        // change and a non-TLS pool rebuild can't diverge. See
+        // `http_tls_config` for the fail-closed substitution.
+        self.rebuild_http_client();
+    }
+
+    /// No-op when HTTP rustls is not the active TLS path (e.g. native-tls
+    /// feature, or TCP-only TLS build).
+    #[cfg(all(
+        not(all(
+            any(feature = "rustls-tls-aws-lc", feature = "rustls-tls-ring"),
+            not(feature = "native-tls")
+        )),
+        any(
+            feature = "rustls-tls-aws-lc",
+            feature = "rustls-tls-ring",
+            feature = "native-tls-rustls"
+        )
+    ))]
+    fn rebuild_http_for_tls(&mut self) {}
 
     /// Used to specify settings that will be passed to all queries.
     ///
@@ -622,6 +968,94 @@ impl Client {
             .bind(query_id)
             .execute()
             .await
+    }
+
+    /// Look up the storage engine of `table` from `system.tables`.
+    ///
+    /// `table` may be qualified (`"db.name"`) or unqualified
+    /// (`"name"`). Unqualified names resolve against the client's
+    /// configured database (set via
+    /// [`with_database`][Self::with_database]); if none is set,
+    /// falls back to ClickHouse's `"default"`.
+    ///
+    /// One round-trip per call. No caching -- callers driving high-
+    /// frequency lookups should memoise themselves.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if `system.tables` is inaccessible (rare; typically a
+    /// permissions issue) or the table doesn't exist.
+    pub async fn table_engine(&self, table: &str) -> Result<String> {
+        let (database, name) = if let Some((d, n)) = table.split_once('.') {
+            (d.to_string(), n.to_string())
+        } else if let Some(d) = &self.database {
+            (d.clone(), table.to_string())
+        } else {
+            ("default".to_string(), table.to_string())
+        };
+        self.query(
+            "SELECT engine FROM system.tables WHERE database = ? AND name = ? LIMIT 1",
+        )
+        .bind(database)
+        .bind(name)
+        .fetch_one::<String>()
+        .await
+    }
+
+    /// Set the durability mode for INSERTs into Distributed-engine
+    /// tables. See [`Durability`] for the per-mode setting map and
+    /// the throughput vs durability tradeoff.
+    ///
+    /// No effect on non-Distributed tables. Maps to ClickHouse
+    /// session settings via [`with_setting`][Self::with_setting];
+    /// equivalent to setting the underlying settings directly.
+    pub fn with_durability(self, mode: Durability) -> Self {
+        match mode {
+            Durability::Background => self, // CH defaults
+            Durability::Foreground => {
+                self.with_setting("distributed_foreground_insert", "1")
+            }
+            Durability::ForegroundFsynced => self
+                .with_setting("distributed_foreground_insert", "1")
+                .with_setting("fsync_after_insert", "1")
+                .with_setting("fsync_directories", "1"),
+        }
+    }
+
+    /// Health check: run `SELECT 1` against the server.
+    ///
+    /// Verifies that the configured URL is reachable, TLS handshake
+    /// works (if applicable), credentials are accepted, and the
+    /// server is processing queries. Returns `Ok(())` on success.
+    ///
+    /// One round-trip per call. Consumers driving high-frequency
+    /// health checks should cap their interval; the CH server's
+    /// dedicated `GET /ping` endpoint is lighter but we don't go
+    /// through that path -- `SELECT 1` exercises the full query
+    /// pipeline.
+    pub async fn ping(&self) -> Result<()> {
+        self.query("SELECT 1").execute().await
+    }
+
+
+    /// `true` if `table` is backed by the `Distributed` engine.
+    ///
+    /// Use this BEFORE trusting row positions in
+    /// [`crate::recovery::FailureLocation`] --
+    /// Distributed tables fan out to shards and the server-reported
+    /// row index is shard-local, NOT coordinator-batch-local, so it
+    /// won't map back to the client batch position. See
+    /// [`crate::recovery::failing_row_from_error`]
+    /// for the caveat.
+    ///
+    /// Thin wrapper over [`table_engine`][Self::table_engine].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`table_engine`][Self::table_engine].
+    pub async fn is_distributed_table(&self, table: &str) -> Result<bool> {
+        let engine = self.table_engine(table).await?;
+        Ok(engine == "Distributed")
     }
 
     /// Enables or disables [`Row`] data types validation against the database schema
@@ -1049,5 +1483,77 @@ mod client_tests {
 
         assert_eq!(client.set_setting("foo", "foo_2"), Some("foo".to_string()));
         assert_eq!(client.set_setting("bar", "bar_2"), Some("bar".to_string()));
+    }
+}
+
+#[cfg(all(test, any(feature = "rustls-tls-aws-lc", feature = "rustls-tls-ring")))]
+mod tls_builder_tests {
+    use super::*;
+
+    #[test]
+    fn default_client_has_no_tls_source() {
+        let c = Client::default();
+        assert!(c.tls_resolved.is_none());
+    }
+
+    #[test]
+    fn native_roots_toggle_sets_resolved() {
+        let c = Client::default().with_tls_native_roots(true);
+        assert!(c.tls_resolved.is_some(), "toggle must resolve a config");
+    }
+
+    #[test]
+    fn root_ca_missing_path_errors() {
+        let r = Client::default().try_with_tls_root_ca("/no/such/ca.pem");
+        let err = match r {
+            Ok(_) => panic!("missing CA path must error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("cannot read CA file"));
+    }
+
+    #[test]
+    fn exclusive_without_ca_records_intent_but_no_resolved() {
+        // Exclusive trust with no explicit CA cannot resolve a config.
+        // Fail-closed: tls_resolved stays None, but tls_source records the
+        // configured intent so transports refuse to fall back to broad
+        // default trust.
+        let c = Client::default().with_tls_roots_exclusive();
+        assert!(
+            c.tls_resolved.is_none(),
+            "exclusive trust with no CA must not resolve a config"
+        );
+        assert!(
+            c.tls_source.is_some(),
+            "configured-trust intent must be recorded even when resolve fails"
+        );
+    }
+
+    // Fail-closed must survive a NON-TLS pool rebuild. Before the
+    // shared `http_tls_config` helper, `with_pool_idle_timeout` (and
+    // the other `with_pool_*` setters) passed `tls_resolved` raw, so
+    // the (Some, None) state reverted to the default webpki path
+    // (fail-open). The helper substitutes an empty-roots config for
+    // EVERY http rebuild; assert it returns Some for that state.
+    #[cfg(not(feature = "native-tls"))]
+    #[test]
+    fn failclosed_survives_non_tls_pool_rebuild() {
+        use std::time::Duration;
+        let c = Client::default()
+            .with_tls_roots_exclusive()
+            .with_pool_idle_timeout(Duration::from_secs(1));
+        assert!(
+            c.tls_source.is_some(),
+            "configured-trust intent must survive a pool rebuild"
+        );
+        assert!(
+            c.tls_resolved.is_none(),
+            "exclusive trust with no CA stays unresolved"
+        );
+        assert!(
+            c.http_tls_config().is_some(),
+            "fail-closed: (Some, None) must yield an empty-roots config, \
+             never the default webpki path"
+        );
     }
 }

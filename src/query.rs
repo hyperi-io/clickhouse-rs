@@ -299,6 +299,52 @@ impl Query {
         }
     }
 
+    /// Configure a single role for this query. Thin convenience over
+    /// [`with_roles`][Self::with_roles] for the common single-role
+    /// case; saves the `[role]` iterator construction at the call
+    /// site. Same override semantics as `with_roles`.
+    ///
+    /// [roles]: https://clickhouse.com/docs/operations/access-rights#role-management
+    pub fn with_role(self, role: impl Into<String>) -> Self {
+        self.with_roles(std::iter::once(role))
+    }
+
+    /// Set the server-side `session_id` for this query.
+    ///
+    /// Avoids `SET role` / `SET session ...` leakage across users on
+    /// a pooled HTTP/1.1 keep-alive connection: ClickHouse natively
+    /// supports `session_id` as a URL parameter, scoping the session
+    /// to this request. The id is opaque to the server -- callers
+    /// pick the value (UUID or app-prefixed string).
+    pub fn with_session_id(self, id: impl Into<String>) -> Self {
+        self.with_setting(crate::settings::SESSION_ID, id)
+    }
+
+    /// Toggle server-side `async_insert` for this query.
+    ///
+    /// Wraps the two underlying settings:
+    ///   - `async_insert=1`
+    ///   - `wait_for_async_insert={wait as int}`
+    ///
+    /// `wait=true` (recommended): client awaits the server-side
+    /// flush. Atomicity per-query is preserved, but see
+    /// [ClickHouse#86651](https://github.com/ClickHouse/ClickHouse/issues/86651)
+    /// for the flush-poisoning hazard. `wait=false` is fire-and-
+    /// forget: the server acknowledges the queue insert immediately
+    /// and applies the row at the next flush. No atomicity, no
+    /// row-level errors; rows may be lost if the server crashes
+    /// before flush.
+    ///
+    /// Server-side async_insert is orthogonal to
+    /// [`AsyncInserter<T>`][crate::async_inserter::AsyncInserter]:
+    /// client-side batching produces large blocks for the server to
+    /// then queue. Combining both is the typical PB/hr ingest
+    /// pattern.
+    pub fn async_insert(self, wait: bool) -> Self {
+        self.with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", if wait { "1" } else { "0" })
+    }
+
     /// Clear any explicit [roles] previously set on this `Query` or inherited from [`Client`].
     ///
     /// Overrides any roles previously set by [`Query::with_roles`], [`Query::with_setting`],
