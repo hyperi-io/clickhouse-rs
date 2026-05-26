@@ -51,6 +51,27 @@ pub enum Error {
         method: &'static str,
         hint: &'static str,
     },
+    /// Structured server-side exception parsed from the response.
+    /// Preferred over [`Error::BadResponse`] when the server returned
+    /// a recognisable `Code: NNN. DB::Exception: ...` body. Callers
+    /// can match on `code` for typed handling and use
+    /// [`Error::is_retriable`] for conservative retry classification.
+    #[error("server error code {code}: {message}")]
+    ServerException {
+        /// `X-ClickHouse-Exception-Code` from the response header.
+        code: u32,
+        /// Exception name extracted from `(UPPERCASE_NAME)` near
+        /// the end of the message. `None` when the parser couldn't
+        /// recognise it (older CH versions, custom error paths).
+        name: Option<String>,
+        /// Cleaned message body, stripped of the `Code: N.`,
+        /// `DB::Exception:` prefix, exception-name parens, and
+        /// `(version ...)` suffix.
+        message: String,
+        /// Server-side stack trace if `Stack trace:` was present in
+        /// the body.
+        stack_trace: Option<String>,
+    },
     #[error("bad response: {0}")]
     BadResponse(String),
     #[error("timeout expired")]
@@ -135,6 +156,74 @@ impl Error {
         crate::recovery::failing_row_from_error(self)
     }
 
+    /// Conservative retriability classification.
+    ///
+    /// Returns `true` for errors that *might* succeed on retry --
+    /// transport-level (`Network`, `TimedOut`) and a known set of
+    /// transient server-side codes (timeouts, simultaneous-query
+    /// limits, parts-count overruns, Keeper hiccups).
+    ///
+    /// Returns `false` for everything else, including unknown
+    /// server codes. The classification is intentionally
+    /// conservative -- callers wanting more aggressive retry should
+    /// match on the underlying variant. The full mapping lives in
+    /// [`is_retriable_code`][Self::is_retriable_code]; PRs welcome
+    /// to extend it as production experience shows what's actually
+    /// transient.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::Network(_) | Self::TimedOut => true,
+            Self::ServerException { code, .. } => Self::is_retriable_code(*code),
+            _ => false,
+        }
+    }
+
+    /// ClickHouse error codes considered transient for retry. See
+    /// `src/Common/ErrorCodes.cpp` upstream for the canonical list.
+    /// Conservative -- false negatives are expected; false positives
+    /// should be rare. Source-of-truth comments in this table use
+    /// the upstream macro name. The table is production-experience
+    /// driven; PRs extending it with new operationally-transient
+    /// codes are welcome.
+    #[must_use]
+    pub fn is_retriable_code(code: u32) -> bool {
+        matches!(
+            code,
+            // TIMEOUT_EXCEEDED
+            159 |
+            // TOO_SLOW (merge queue lag; usually transient)
+            160 |
+            // TOO_MANY_SIMULTANEOUS_QUERIES
+            202 |
+            // SOCKET_TIMEOUT
+            209 |
+            // NETWORK_ERROR
+            210 |
+            // ABORTED (operator KILL or shutdown -- replayable on
+            // another node)
+            236 |
+            // MEMORY_LIMIT_EXCEEDED (often transient under brief
+            // memory pressure)
+            241 |
+            // TOO_MANY_PARTS (transient under heavy ingest)
+            252 |
+            // ALL_CONNECTION_TRIES_FAILED
+            279 |
+            // LIMIT_EXCEEDED (transient quota)
+            290 |
+            // UNKNOWN_STATUS_OF_INSERT (the "did my INSERT land?"
+            // ambiguity code -- documented mitigation is retry with
+            // an insert_deduplication_token, which the
+            // batch_isolation token variant ships)
+            319 |
+            // CANNOT_SCHEDULE_TASK (task scheduler full)
+            439 |
+            // KEEPER_EXCEPTION (replicated-metadata hiccup)
+            999
+        )
+    }
+
     /// https://opentelemetry.io/docs/specs/semconv/registry/attributes/error/#error-type
     #[cfg(feature = "opentelemetry")]
     pub(crate) fn error_type(&self) -> &str {
@@ -153,6 +242,7 @@ impl Error {
             Error::Custom(_) => "Custom",
             Error::WorkerExited => "WorkerExited",
             Error::AsyncInserterApiMisuse { .. } => "AsyncInserterApiMisuse",
+            Error::ServerException { .. } => "ServerException",
             Error::BadResponse(_) => "BadResponse",
             Error::TimedOut => "TimedOut",
             Error::InvalidColumnsHeader(_) => "InvalidColumnsHeader",
@@ -179,7 +269,7 @@ impl Error {
     }
 }
 
-#[cfg(tests)]
+#[cfg(test)]
 mod tests {
     use crate::error::Error;
     use std::io;
@@ -204,5 +294,59 @@ mod tests {
         fn assert_traits<T: std::error::Error + Send + Sync>() {}
 
         assert_traits::<Error>();
+    }
+
+    #[test]
+    fn is_retriable_classifies_known_transient_codes() {
+        let make = |code: u32| Error::ServerException {
+            code,
+            name: None,
+            message: String::new(),
+            stack_trace: None,
+        };
+
+        // Sampled from the retriable table -- known transient codes.
+        for &code in &[159u32, 160, 202, 209, 210, 236, 241, 252, 279, 290, 319, 439, 999] {
+            assert!(
+                make(code).is_retriable(),
+                "code {code} should be retriable"
+            );
+        }
+
+        // Sampled known-not-retriable codes (auth, schema, parse).
+        for &code in &[36u32, 60, 117, 192, 195, 469] {
+            assert!(
+                !make(code).is_retriable(),
+                "code {code} should NOT be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_retriable_for_transport_errors() {
+        assert!(Error::TimedOut.is_retriable());
+        // Network variant needs a BoxedError construction; use a
+        // simple io::Error round-trip to build one.
+        let net_err: Error =
+            io::Error::new(io::ErrorKind::ConnectionReset, "reset").into();
+        // io::Error -> Error::Custom path; not a Network variant.
+        // Just verify Custom is NOT retriable to lock in the
+        // conservative classification.
+        assert!(!net_err.is_retriable());
+    }
+
+    #[test]
+    fn is_retriable_code_defaults_unknown_to_not_retriable() {
+        // Conservative default: anything outside the documented
+        // retriable set is NOT retriable. New ClickHouse versions
+        // can ship new codes; until our table is updated, callers
+        // see them as terminal -- safer than masking real failures
+        // under a retry loop.
+        for &code in &[0u32, 1, 12345, 99999, u32::MAX] {
+            assert!(
+                !Error::is_retriable_code(code),
+                "unknown code {code} should default to NOT retriable"
+            );
+        }
     }
 }

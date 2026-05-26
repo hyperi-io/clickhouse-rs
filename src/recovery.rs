@@ -31,6 +31,10 @@ use crate::error::Error;
 pub fn failing_row_from_error(err: &Error) -> Option<FailureLocation> {
     let msg = match err {
         Error::BadResponse(s) => s.as_str(),
+        // Structured server exception -- the cleaned message body is
+        // exactly what the patterns expect (no "Code: N." or name
+        // chrome to skip past).
+        Error::ServerException { message, .. } => message.as_str(),
         _ => return None,
     };
     parse_failure_location(msg)
@@ -181,6 +185,28 @@ mod tests {
     fn non_bad_response_returns_none() {
         let err = Error::Custom("custom".into());
         assert_eq!(failing_row_from_error(&err), None);
+    }
+
+    /// `Error::ServerException` carries the same message text as
+    /// `BadResponse` (just structurally), so the row-N extraction
+    /// works on both variants.
+    #[test]
+    fn extracts_from_server_exception_variant() {
+        let err = Error::ServerException {
+            code: 469,
+            name: Some("VIOLATED_CONSTRAINT".to_string()),
+            message: "Constraint `x_lt_10` is violated at row 5000. \
+                      Expression: (x < 10). Column values: x = 100"
+                .to_string(),
+            stack_trace: None,
+        };
+        assert_eq!(
+            failing_row_from_error(&err),
+            Some(FailureLocation {
+                row: 5000,
+                category: FailureCategory::Constraint,
+            })
+        );
     }
 
     #[test]

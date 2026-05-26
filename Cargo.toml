@@ -75,6 +75,11 @@ name = "progress"
 harness = false
 required-features = ["test-util"]
 
+[[bench]]
+name = "auto_query_id"
+harness = false
+required-features = ["uuid", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]
@@ -171,7 +176,7 @@ lz4_flex = { version = "0.11.6", default-features = false, features = [
 ], optional = true }
 cityhash-rs = { version = "=1.0.1", optional = true } # exact version for safety, this package has been stable for years
 zstd = { version = "0.13", default-features = false, optional = true }
-uuid = { version = "1", optional = true }
+uuid = { version = "1", optional = true, features = ["v7"] }
 time = { version = "0.3", optional = true }
 chrono = { version = "0.4", optional = true, features = ["serde"] }
 bstr = { version = "1.11.0", default-features = false }

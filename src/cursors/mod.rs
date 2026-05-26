@@ -3,4 +3,4 @@ pub use self::{bytes::BytesCursor, row::RowCursor};
 
 mod bytes;
 mod raw;
-mod row;
+pub(crate) mod row;

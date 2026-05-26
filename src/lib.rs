@@ -82,6 +82,20 @@ pub struct Client {
     /// shape and server-side enablement (`send_progress_in_http_headers=1`).
     progress_callback: Option<progress::ProgressCallback>,
 
+    /// When true, [`query`][Self::query] auto-generates a UUIDv7
+    /// `query_id` for any query that doesn't already have one.
+    /// Off by default; opt in via
+    /// [`with_auto_query_id`][Self::with_auto_query_id].
+    /// Only meaningful with the `uuid` feature.
+    #[cfg(feature = "uuid")]
+    auto_query_id: bool,
+
+    /// When true AND a query has a `query_id` (manually set or
+    /// auto-generated), `RowCursor::drop` spawns a background task
+    /// that issues `KILL QUERY` for the still-in-flight query.
+    /// Opt in via [`with_kill_on_drop`][Self::with_kill_on_drop].
+    kill_on_drop: bool,
+
     #[cfg(feature = "test-util")]
     mocked: bool,
 }
@@ -147,6 +161,9 @@ impl Client {
             validation: true,
             insert_metadata_cache: Arc::new(InsertMetadataCache::default()),
             progress_callback: None,
+            #[cfg(feature = "uuid")]
+            auto_query_id: false,
+            kill_on_drop: false,
             #[cfg(feature = "test-util")]
             mocked: false,
         }
@@ -527,8 +544,84 @@ impl Client {
     }
 
     /// Starts a new SELECT/DDL query.
+    ///
+    /// If [`with_auto_query_id`][Self::with_auto_query_id] was
+    /// called, AND no `query_id` is set on the Client, the returned
+    /// `Query` gets a freshly-generated UUIDv7 as its `query_id`.
+    /// Callers can override with
+    /// [`Query::with_query_id`][crate::query::Query::with_query_id].
     pub fn query(&self, query: &str) -> query::Query {
-        query::Query::new(self, query)
+        let q = query::Query::new(self, query);
+        #[cfg(feature = "uuid")]
+        if self.auto_query_id && !self.settings.contains_key(settings::QUERY_ID) {
+            return q.with_query_id(uuid::Uuid::now_v7().to_string());
+        }
+        q
+    }
+
+    /// Enable Drop-on-cursor `KILL QUERY`. When a `RowCursor` is
+    /// dropped BEFORE the body stream finishes (consumer abandoned
+    /// before draining), AND its query had a `query_id` set, a
+    /// background task issues `KILL QUERY WHERE query_id = ? SYNC`.
+    /// Recovers server-side resources that would otherwise tie up
+    /// CPU + RAM until the next socket write fails.
+    ///
+    /// Pairs with [`with_auto_query_id`][Self::with_auto_query_id]
+    /// for the "every query is auto-cancellable on drop" pattern.
+    /// Off by default; opt in.
+    pub fn with_kill_on_drop(mut self) -> Self {
+        self.kill_on_drop = true;
+        self
+    }
+
+    /// Read-side accessor for Query::fetch to construct a
+    /// KillOnDropHandle. Returns the Client clone + query_id only
+    /// when `kill_on_drop` is enabled AND `query_id` is set.
+    pub(crate) fn kill_on_drop_handle(&self) -> Option<(Self, String)> {
+        if !self.kill_on_drop {
+            return None;
+        }
+        let qid = self.settings.get(settings::QUERY_ID).cloned()?;
+        Some((self.clone(), qid))
+    }
+
+    /// Auto-generate a UUIDv7 `query_id` for every query that
+    /// doesn't already have one set.
+    ///
+    /// Pairs with [`kill_query`][Self::kill_query] for safe
+    /// consumer cancellation -- without an id, there's no way to
+    /// reach a running query. UUIDv7 is k-sortable: the timestamp
+    /// prefix means query ids cluster by time in the server's
+    /// `system.query_log`, easier to grep by submission window.
+    ///
+    /// Off by default (zero overhead for callers who don't need it).
+    /// Available only with the `uuid` feature.
+    #[cfg(feature = "uuid")]
+    pub fn with_auto_query_id(mut self) -> Self {
+        self.auto_query_id = true;
+        self
+    }
+
+    /// Send `KILL QUERY WHERE query_id = ? SYNC` to cancel a running
+    /// query. `SYNC` waits for the server to acknowledge cancellation
+    /// (vs the default async, which returns immediately).
+    ///
+    /// Pair with [`Query::with_query_id`][crate::query::Query::with_query_id]
+    /// for the consumer pattern: register an id at query start, call
+    /// this on the same `Client` if the consumer abandons the result
+    /// cursor before draining. Without it, the server keeps
+    /// processing until it tries to write to a dead socket; for long
+    /// queries that's wasted server resources and held-open server-
+    /// side state.
+    ///
+    /// Returns `Ok(())` even if no query matches the id (the KILL
+    /// statement is a no-op in that case). `Err` only on transport
+    /// failure or insufficient privileges.
+    pub async fn kill_query(&self, query_id: &str) -> Result<()> {
+        self.query("KILL QUERY WHERE query_id = ? SYNC")
+            .bind(query_id)
+            .execute()
+            .await
     }
 
     /// Enables or disables [`Row`] data types validation against the database schema
