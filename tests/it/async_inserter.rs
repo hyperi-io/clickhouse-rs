@@ -476,3 +476,94 @@ async fn cross_table_watermark_triggers_flush_across_all_tables() {
     assert_eq!(rows_a, vec![SimpleRow::new(1, "a")]);
     assert_eq!(rows_b, vec![SimpleRow::new(2, "b")]);
 }
+
+// ---------------------------------------------------------------------------
+// Per-commit observability callback
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn commit_callback_fires_per_flush_with_table_name_and_quantities() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let _rec = mock.add(test::handlers::record::<SimpleRow>());
+
+    let log: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_for_cb = Arc::clone(&log);
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new(
+        &client,
+        "t",
+        AsyncInserterConfig::default()
+            .without_period()
+            .with_commit_callback(move |table, q| {
+                log_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((table.to_string(), q.rows));
+            }),
+    );
+
+    inserter.write(SimpleRow::new(1, "a")).await.unwrap();
+    inserter.write(SimpleRow::new(2, "b")).await.unwrap();
+    inserter.flush().await.unwrap();
+    inserter.end().await.unwrap();
+
+    let entries = log.lock().unwrap().clone();
+    // Exactly one non-zero commit (the flush). end() on a freshly
+    // flushed inserter has zero rows pending so it doesn't fire.
+    assert!(
+        !entries.is_empty(),
+        "commit callback should fire at least once"
+    );
+    for (table, _rows) in &entries {
+        assert_eq!(table, "t");
+    }
+    let total_rows: u64 = entries.iter().map(|(_, r)| r).sum();
+    assert_eq!(total_rows, 2, "callback saw {entries:?}");
+}
+
+#[tokio::test]
+async fn commit_callback_distinguishes_tables_in_multi_table_mode() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    let mock = test::Mock::new();
+    let client = Client::default().with_mock(&mock);
+    let _rec_a = mock.add(test::handlers::record::<SimpleRow>());
+    let _rec_b = mock.add(test::handlers::record::<SimpleRow>());
+
+    let by_table: Arc<Mutex<std::collections::HashMap<String, u64>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let by_table_for_cb = Arc::clone(&by_table);
+
+    let inserter: AsyncInserter<SimpleRow> = AsyncInserter::new_multi_table(
+        &client,
+        AsyncInserterConfig::default()
+            .without_period()
+            .with_commit_callback(move |table, q| {
+                *by_table_for_cb
+                    .lock()
+                    .unwrap()
+                    .entry(table.to_string())
+                    .or_insert(0) += q.rows;
+            }),
+    );
+
+    inserter
+        .write_to("table_a", SimpleRow::new(1, "a"))
+        .await
+        .unwrap();
+    inserter
+        .write_to("table_b", SimpleRow::new(2, "b"))
+        .await
+        .unwrap();
+    inserter.flush().await.unwrap();
+    inserter.end().await.unwrap();
+
+    let final_state = by_table.lock().unwrap().clone();
+    assert_eq!(final_state.get("table_a"), Some(&1));
+    assert_eq!(final_state.get("table_b"), Some(&1));
+}

@@ -88,9 +88,27 @@ pub enum WriterId {
     Disabled,
 }
 
+/// Synchronous per-flush observability hook. Fires on every commit
+/// (auto-commit from write threshold, explicit flush, end). Called
+/// from the worker task; must not block. First arg is the table
+/// name; second is the [`Quantities`] of THIS commit (zeros for
+/// no-op commits). `Arc` so all per-table commits share the same
+/// callback instance across the AsyncInserter's lifetime.
+///
+/// # Per-call budget
+///
+/// Target < 1 microsecond per invocation. The dispatch is
+/// synchronous on the worker task, so a slow callback serialises
+/// flushes across all tables. Increment a counter, atomic-store
+/// to an `AtomicU64`, or push to a bounded channel -- anything
+/// heavier (lock acquisition, `tracing::info!` to a remote
+/// subscriber, file I/O) should spawn a separate observer task
+/// fed by the channel instead.
+pub type CommitCallback = Arc<dyn Fn(&str, &Quantities) + Send + Sync + 'static>;
+
 /// Thresholds for [`AsyncInserter`]. Defaults match ClickHouse's
 /// recommended batch sizes.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AsyncInserterConfig {
     /// Row-count flush threshold. Default: `100_000`.
     pub max_rows: u64,
@@ -114,6 +132,23 @@ pub struct AsyncInserterConfig {
     /// [`WriterId::Auto`] mitigates async_insert flush poisoning;
     /// see [`WriterId`] for the rationale.
     pub writer_id: WriterId,
+    /// Optional per-flush observability hook. See [`CommitCallback`]
+    /// and [`with_commit_callback`][Self::with_commit_callback].
+    pub commit_callback: Option<CommitCallback>,
+}
+
+// Manual Debug because `dyn Fn` is not Debug.
+impl std::fmt::Debug for AsyncInserterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncInserterConfig")
+            .field("max_rows", &self.max_rows)
+            .field("max_bytes", &self.max_bytes)
+            .field("max_period", &self.max_period)
+            .field("channel_capacity", &self.channel_capacity)
+            .field("writer_id", &self.writer_id)
+            .field("commit_callback", &self.commit_callback.as_ref().map(|_| "<closure>"))
+            .finish()
+    }
 }
 
 impl Default for AsyncInserterConfig {
@@ -125,6 +160,7 @@ impl Default for AsyncInserterConfig {
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             cross_table_max_bytes: None,
             writer_id: WriterId::Auto,
+            commit_callback: None,
         }
     }
 }
@@ -213,6 +249,27 @@ impl AsyncInserterConfig {
         self.writer_id = WriterId::Disabled;
         self
     }
+
+    /// Register a per-flush callback. Fires after every per-table
+    /// commit -- threshold-triggered auto-commits during `write`,
+    /// explicit `flush`, and final `end`. First arg is the table
+    /// name; second is the [`Quantities`] of THIS commit (zeros for
+    /// no-op commits when there were no buffered rows).
+    ///
+    /// Use this for per-table metrics, audit logs, or downstream
+    /// pipeline notifications. The callback runs inline on the
+    /// worker task -- must not block. For real work, channel out
+    /// or spawn.
+    ///
+    /// Multi-table: fires once per (table, commit) pair, so a
+    /// `flush` across N tables produces N callback invocations.
+    pub fn with_commit_callback(
+        mut self,
+        cb: impl Fn(&str, &Quantities) + Send + Sync + 'static,
+    ) -> Self {
+        self.commit_callback = Some(Arc::new(cb));
+        self
+    }
 }
 
 /// Resolve a [`WriterId`] to the actual `log_comment` string (if
@@ -239,6 +296,19 @@ fn generate_auto_writer_id() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     format!("clickhouse-rs:async_inserter:{nanos:x}:{seq:x}")
+}
+
+/// Dispatch `cb(table, q)` iff `cb` is set AND the commit actually
+/// did work (zero-transaction commits indicate no buffered rows --
+/// observers don't need to see them). Shared by `write_one`,
+/// `force_commit_all`, the `Flush` arm, and the `End` arm.
+#[inline]
+fn fire_callback(cb: Option<&CommitCallback>, table: &str, q: &Quantities) {
+    if q.transactions > 0
+        && let Some(cb) = cb
+    {
+        cb(table, q);
+    }
 }
 
 /// Build one [`Inserter<T>`] for `table` from `client` + `config` +
@@ -392,6 +462,10 @@ struct InserterWorker<T> {
     /// re-applied to every per-table Inserter so they all share the
     /// same server-side flush queue partition.
     writer_id: Option<String>,
+    /// Cloned from config for per-commit dispatch. Cached on the
+    /// worker to skip the `config.commit_callback.as_ref()` lookup
+    /// on the hot path.
+    commit_callback: Option<CommitCallback>,
     /// Eager entry for single-table; lazy insert on first `WriteTo`.
     /// `BTreeMap` so iteration order is deterministic across runs --
     /// `Flush` / `End` visit tables in lexicographic order, which makes
@@ -433,14 +507,27 @@ where
     /// Write one row + run threshold-triggered auto-commit. Propagates
     /// serialise AND auto-commit errors (architecture.md section 11).
     ///
+    /// Fires the per-commit callback if configured AND the commit
+    /// actually completed (non-zero `transactions`); zero-transaction
+    /// commits mean the threshold wasn't tripped, so no actual
+    /// server-side INSERT happened.
+    ///
     /// After the per-table commit, if the cross-table watermark
     /// is configured AND the sum of pending bytes across ALL
     /// inserters exceeds it, force-flush every table.
     async fn write_one(&mut self, table: Arc<str>, row: &T) -> Result<()> {
+        let callback = self.commit_callback.clone();
+        // Only clone the table arc when there's a callback to feed it
+        // to; the common (callback = None) path skips the refcount bump.
+        let table_for_callback =
+            callback.as_ref().map(|_| Arc::clone(&table));
         {
             let inserter = self.get_or_create(table);
             inserter.write(row).await?;
-            inserter.commit().await?;
+            let quantities = inserter.commit().await?;
+            if let Some(tab) = table_for_callback.as_deref() {
+                fire_callback(callback.as_ref(), tab, &quantities);
+            }
         }
 
         if let Some(threshold) = self.config.cross_table_max_bytes {
@@ -464,22 +551,25 @@ where
 
     /// Force-commit every per-table inserter. Used by the
     /// cross-table watermark check in [`write_one`][Self::write_one].
+    /// Fires the per-commit callback for each non-zero commit.
     /// Stops on the first per-table error.
     async fn force_commit_all(&mut self) -> Result<()> {
-        for inserter in self.inserters.values_mut() {
-            inserter.force_commit().await?;
+        let callback = self.commit_callback.clone();
+        for (table, inserter) in self.inserters.iter_mut() {
+            let q = inserter.force_commit().await?;
+            fire_callback(callback.as_ref(), table.as_ref(), &q);
         }
         Ok(())
     }
 
-    /// Consume every per-table inserter so each one's consuming
-    /// [`Inserter::end()`] can run. Used by `End` and `on_shutdown`.
-    /// The intermediate `Vec` is forced because we need to await
-    /// each `end()` and a borrowed `BTreeMap` iter can't be held
-    /// across `.await`.
-    fn drain_inserters(&mut self) -> Vec<Inserter<T>> {
+    /// Consume every per-table inserter (paired with its table arc)
+    /// so each one's consuming [`Inserter::end()`] can run. Used by
+    /// `End` and `on_shutdown`. The intermediate `Vec` is forced
+    /// because we need to await each `end()` and a borrowed
+    /// `BTreeMap` iter can't be held across `.await`.
+    fn drain_inserters_with_tables(&mut self) -> Vec<(Arc<str>, Inserter<T>)> {
         std::mem::take(&mut self.inserters)
-            .into_values()
+            .into_iter()
             .collect()
     }
 }
@@ -535,13 +625,15 @@ where
                 // their buffers; already-flushed tables are in CH
                 // (replay relies on server-side dedup -- 11.2).
                 let mut total = Quantities::ZERO;
-                for inserter in self.inserters.values_mut() {
+                let callback = self.commit_callback.clone();
+                for (table, inserter) in self.inserters.iter_mut() {
                     match inserter.force_commit().await {
                         Ok(q) => {
                             total.bytes = total.bytes.saturating_add(q.bytes);
                             total.rows = total.rows.saturating_add(q.rows);
                             total.transactions =
                                 total.transactions.saturating_add(q.transactions);
+                            fire_callback(callback.as_ref(), table.as_ref(), &q);
                         }
                         Err(e) => {
                             let _ = reply.send(Err(e));
@@ -554,13 +646,15 @@ where
             AsyncInserterCommand::End(reply) => {
                 let mut total = Quantities::ZERO;
                 let mut last_err: Option<Error> = None;
-                for inserter in self.drain_inserters() {
+                let callback = self.commit_callback.clone();
+                for (table, inserter) in self.drain_inserters_with_tables() {
                     match inserter.end().await {
                         Ok(q) => {
                             total.bytes = total.bytes.saturating_add(q.bytes);
                             total.rows = total.rows.saturating_add(q.rows);
                             total.transactions =
                                 total.transactions.saturating_add(q.transactions);
+                            fire_callback(callback.as_ref(), table.as_ref(), &q);
                         }
                         Err(e) => last_err = Some(e),
                     }
@@ -586,8 +680,10 @@ where
             return;
         }
         // Worker's final cleanup: drain each inserter; errors dropped
-        // (no caller to receive them).
-        for inserter in self.drain_inserters() {
+        // (no caller to receive them). Table names discarded -- the
+        // commit callback fires only via the user-visible End command,
+        // not implicit shutdown.
+        for (_table, inserter) in self.drain_inserters_with_tables() {
             let _ = inserter.end().await;
         }
         self.ended = true;
@@ -745,11 +841,13 @@ where
         }
 
         let channel_capacity = config.channel_capacity;
+        let commit_callback = config.commit_callback.clone();
         let worker = InserterWorker {
             client: client.clone(),
             config: config.clone(),
             default_table,
             writer_id,
+            commit_callback,
             inserters,
             ended: false,
         };
@@ -1084,5 +1182,21 @@ mod interner_tests {
         for unique in &arcs[4..] {
             assert!(!Arc::ptr_eq(&arcs[0], unique));
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_bound_tests {
+    use super::*;
+
+    // CommitCallback must remain Send + Sync + 'static so the worker
+    // task (`tokio::spawn`-ed) can hold and dispatch it across thread
+    // boundaries. A future refactor that drops any of those bounds
+    // would compile in isolation but break the multi-thread runtime
+    // at the point of construction; this test fails first.
+    #[test]
+    fn commit_callback_is_send_sync_static() {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<CommitCallback>();
     }
 }
