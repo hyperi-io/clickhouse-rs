@@ -3,6 +3,9 @@
 //! Submodules:
 //! - [`protocol`] -- wire constants, packet IDs, server response staging types.
 //! - [`transport`] -- `MaybeTlsStream` plain-or-TLS adapter + buffer sizes.
+//! - [`client_info`] -- `ClientInfo` block emitted inside the Query packet.
+//! - [`writer`] -- client-side packet encoders (Hello, Query, Data, Cancel,
+//!   Ping, Addendum) over the [`crate::native::io::ClickHouseWrite`] trait.
 //!
 //! Wire-format primitives (varint, length-prefixed string, fixed-width
 //! LE) come from [`crate::native::io`]; this module does not duplicate
@@ -17,5 +20,7 @@
 // from the lint.
 #![allow(dead_code)]
 
+pub(crate) mod client_info;
 pub(crate) mod protocol;
 pub(crate) mod transport;
+pub(crate) mod writer;

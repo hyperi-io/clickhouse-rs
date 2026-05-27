@@ -26,6 +26,8 @@ use crate::error::{Error, Result};
 // and clickhouse-cpp-client `protocol.h` (mainline, commit e903492).
 // ---------------------------------------------------------------------------
 
+pub(crate) const DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES: u64 = 50264;
+pub(crate) const DBMS_MIN_REVISION_WITH_BLOCK_INFO: u64 = 51903;
 pub(crate) const DBMS_MIN_REVISION_WITH_CLIENT_INFO: u64 = 54032;
 pub(crate) const DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE: u64 = 54058;
 pub(crate) const DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO: u64 = 54060;
