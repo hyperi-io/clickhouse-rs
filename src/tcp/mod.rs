@@ -6,6 +6,10 @@
 //! - [`client_info`] -- `ClientInfo` block emitted inside the Query packet.
 //! - [`writer`] -- client-side packet encoders (Hello, Query, Data, Cancel,
 //!   Ping, Addendum) over the [`crate::native::io::ClickHouseWrite`] trait.
+//! - [`reader`] -- server-side packet decoders (Hello, Data header,
+//!   Exception, Progress, ProfileInfo, TableColumns, Pong, EndOfStream,
+//!   Log, ProfileEvents, TimezoneUpdate) over the
+//!   [`crate::native::io::ClickHouseRead`] trait.
 //!
 //! Wire-format primitives (varint, length-prefixed string, fixed-width
 //! LE) come from [`crate::native::io`]; this module does not duplicate
@@ -22,5 +26,6 @@
 
 pub(crate) mod client_info;
 pub(crate) mod protocol;
+pub(crate) mod reader;
 pub(crate) mod transport;
 pub(crate) mod writer;
