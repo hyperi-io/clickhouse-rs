@@ -48,22 +48,30 @@ pub(crate) const DBMS_MIN_REVISION_WITH_TOTAL_ROWS_IN_PROGRESS: u64 = 51554;
 
 /// Decoded server-to-client packet.
 ///
-/// `Data` carries header fields only; the column-bytes payload is
-/// pulled from the underlying reader by the cursor + decoder layer
-/// in a follow-up branch. `Log` and `ProfileEvents` discard their
-/// block payloads at the reader -- the connection actor records
-/// them via `tracing` but does not surface them to callers.
+/// For `Data` packets, the empty schema block (num_rows = 0) emitted
+/// by the server at the start of an INSERT has its `(name, type_name)`
+/// column metadata consumed off the wire and surfaced in `columns`.
+/// For data blocks with `num_rows > 0` the column payload is left in
+/// the reader; the cursor + Native decoder in Task 8 consumes it.
+/// `Log` and `ProfileEvents` discard their block payloads at the
+/// reader -- the connection actor records them via `tracing` but
+/// does not surface them to callers.
 #[derive(Debug)]
 pub(crate) enum ServerPacket {
-    /// Data block header. Caller (cursor) reads `num_columns` columns
-    /// of `num_rows` rows each from the same underlying reader.
+    /// Data block header (+ schema metadata for empty blocks).
+    ///
     /// `table_name` is the empty string for default-target INSERTs;
     /// servers below `DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES` (50264)
     /// omit it on the wire (the field is `None` in that case).
+    /// `columns` is non-empty only for the INSERT schema block
+    /// (num_rows == 0); for streaming SELECT blocks the field is an
+    /// empty vec and the column bytes remain in the reader for the
+    /// Task-8 cursor to decode.
     Data {
         table_name: Option<String>,
         num_columns: u64,
         num_rows: u64,
+        columns: Vec<(String, String)>,
     },
     Exception(Exception),
     Progress(Progress),
@@ -275,6 +283,11 @@ pub(crate) async fn read_table_columns<R: ClickHouseRead>(r: &mut R) -> Result<T
 ///
 /// The column-bytes payload is left in the reader; the cursor
 /// + Native decoder in a later branch consumes it.
+///
+/// For empty schema blocks (num_rows == 0) the body has no value
+/// bytes after the (name, type_name) pairs, so callers can use
+/// [`read_empty_data_block_schema`] to consume those without a
+/// full decoder.
 async fn read_data_block_header<R: ClickHouseRead>(
     r: &mut R,
     server_revision: u64,
@@ -325,14 +338,55 @@ async fn read_data_block_header<R: ClickHouseRead>(
     Ok((table_name, num_columns, num_rows))
 }
 
+/// Read the body of an empty Data block (num_rows == 0) -- the
+/// `num_columns` pairs of `(name, type_name)` strings the server
+/// emits at the start of an INSERT, plus the optional custom-
+/// serialization flag byte per column on revisions at and above
+/// `DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION` (54454).
+/// Mirrors the inverse shape that [`crate::native::encode_columns`]
+/// produces.
+///
+/// This helper exists so the actor's reader sub-task can advance
+/// past the schema block without a full Native decoder. The
+/// streaming-block path with non-zero rows lands in Task 8's
+/// cursor and decoder.
+///
+/// # Errors
+///
+/// I/O errors from the underlying reader. The `(name, type_name)`
+/// strings inherit the `MAX_STRING_SIZE` cap from
+/// [`ClickHouseRead::read_utf8_string`], so a corrupt or malicious
+/// schema block cannot OOM the client.
+pub(crate) async fn read_empty_data_block_schema<R: ClickHouseRead>(
+    r: &mut R,
+    num_columns: u64,
+    server_revision: u64,
+) -> Result<Vec<(String, String)>> {
+    let has_custom_ser = server_revision
+        >= crate::native::encode::DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION;
+    let mut out = Vec::with_capacity(usize::try_from(num_columns).unwrap_or(0));
+    for _ in 0..num_columns {
+        let name = r.read_utf8_string().await?;
+        let type_name = r.read_utf8_string().await?;
+        if has_custom_ser {
+            let _flag = r.read_u8().await?;
+        }
+        out.push((name, type_name));
+    }
+    Ok(out)
+}
+
 /// Dispatch a single server packet. Reads the leading varint
 /// packet ID and dispatches to the per-packet decoder. Unknown
 /// IDs return [`Error::BadResponse`] via
 /// [`ServerPacketId::from_u64`].
 ///
-/// For `Data` packets the column-bytes payload is *not* consumed
-/// here -- only the header is returned. The caller must consume
-/// the payload from the same reader before requesting the next
+/// For `Data` packets with `num_rows == 0` (the INSERT schema
+/// block) the body's `(name, type_name)` pairs are consumed via
+/// [`read_empty_data_block_schema`] and exposed in
+/// `ServerPacket::Data::columns`. For `num_rows > 0` the column-
+/// bytes payload is *not* consumed here; the Task-8 cursor must
+/// consume it from the same reader before requesting the next
 /// packet or the stream pointer will misalign.
 pub(crate) async fn read_packet<R: ClickHouseRead>(
     r: &mut R,
@@ -344,10 +398,16 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
         ServerPacketId::Data => {
             let (table_name, num_columns, num_rows) =
                 read_data_block_header(r, server_revision).await?;
+            let columns = if num_rows == 0 {
+                read_empty_data_block_schema(r, num_columns, server_revision).await?
+            } else {
+                Vec::new()
+            };
             Ok(ServerPacket::Data {
                 table_name,
                 num_columns,
                 num_rows,
+                columns,
             })
         }
         ServerPacketId::Exception => Ok(ServerPacket::Exception(read_exception(r).await?)),
@@ -533,5 +593,66 @@ mod tests {
             Error::BadResponse(msg) => assert!(msg.contains("Log packet"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_packet_consumes_empty_data_block_schema() {
+        // The server's INSERT schema block: Data packet, table_name = "",
+        // block-info, num_columns = 2, num_rows = 0, then per-column
+        // (name, type_name, custom_ser_flag).
+        let mut buf = Vec::new();
+        buf.write_var_uint(ServerPacketId::Data as u64).await.unwrap();
+        buf.write_string(b"").await.unwrap(); // table_name
+        // Block info -- mirror the writer side (field_id, value) pairs + terminator.
+        buf.write_var_uint(1).await.unwrap();
+        buf.write_u8(0).await.unwrap();
+        buf.write_var_uint(2).await.unwrap();
+        buf.write_i32_le(-1).await.unwrap();
+        buf.write_var_uint(0).await.unwrap();
+        buf.write_var_uint(2).await.unwrap(); // num_columns
+        buf.write_var_uint(0).await.unwrap(); // num_rows
+        // Column 1.
+        buf.write_string(b"n").await.unwrap();
+        buf.write_string(b"UInt64").await.unwrap();
+        buf.write_u8(0).await.unwrap(); // custom-serialization flag
+        // Column 2.
+        buf.write_string(b"s").await.unwrap();
+        buf.write_string(b"String").await.unwrap();
+        buf.write_u8(0).await.unwrap();
+        // Trailing sentinel so an over-read would show up as misalignment.
+        buf.write_var_uint(ServerPacketId::EndOfStream as u64)
+            .await
+            .unwrap();
+
+        let mut cur = Cursor::new(buf);
+        let pkt = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        match pkt {
+            ServerPacket::Data {
+                table_name,
+                num_columns,
+                num_rows,
+                columns,
+            } => {
+                assert_eq!(table_name.as_deref(), Some(""));
+                assert_eq!(num_columns, 2);
+                assert_eq!(num_rows, 0);
+                assert_eq!(
+                    columns,
+                    vec![
+                        ("n".to_string(), "UInt64".to_string()),
+                        ("s".to_string(), "String".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        // The trailing EndOfStream must still be readable -- proves the
+        // schema-block consume left the stream pointer aligned.
+        let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(trailing, ServerPacket::EndOfStream));
     }
 }

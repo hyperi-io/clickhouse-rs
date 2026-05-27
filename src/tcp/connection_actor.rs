@@ -109,12 +109,42 @@ const DEFAULT_CMD_CHANNEL: usize = 16;
 /// concern once dials are wired through `Client`.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Soft cap on a single INSERT block's pre-encoded payload. A caller
+/// that hands the actor an enormous block would otherwise stall the
+/// actor task (and its pool slot) for the duration of one large socket
+/// write, blocking every other command on that connection -- an
+/// effective self-DoS for a misconfigured client. Blocks past this cap
+/// are rejected with an error instead of transmitted; split the batch
+/// into smaller blocks (server `max_insert_block_size` defaults to 1M
+/// rows, far under this byte ceiling for typical row widths). 512 MiB
+/// is generous head-room over any sane block; it exists to catch
+/// pathological inputs, not to tune throughput.
+const MAX_INSERT_BLOCK_BYTES: usize = 512 * 1024 * 1024;
+
+/// Runtime state of the actor. `Idle` (post-handshake, between
+/// commands, after FinishInsert / Exception); `InsertActive` between
+/// a successful `BeginInsert` and the matching `FinishInsert` or
+/// surfaced Exception.
+///
+/// Captured as a plain field rather than as type-state: the actor is
+/// a single sequential task driving a wire protocol, and the small
+/// state machine is easier to reason about as a runtime enum than as
+/// phantom-type generics threaded through the `CommandWorker`
+/// machinery. Out-of-state commands surface as
+/// `Error::Custom("tcp: ...")` replies instead of panics so the
+/// caller can recover (e.g. propagate the typed error to a
+/// transaction-level handler).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorState {
+    Idle,
+    InsertActive,
+}
+
 /// Commands the [`ConnectionActor`] accepts.
 ///
 /// Each variant embeds its own reply channel -- `oneshot` for single
 /// replies, `mpsc` for streams -- so the actor never has to track
-/// caller identity. Subsequent branches extend this enum with
-/// `BeginInsert`, `SendInsertBlock`, `FinishInsert`, `ExecuteStream`.
+/// caller identity. The streaming SELECT variant lands in Task 8.
 pub(crate) enum ConnectionCmd {
     /// Send a Ping; reply with `Ok(())` when Pong arrives, `Err` on
     /// I/O failure or a server Exception in place of Pong.
@@ -131,6 +161,44 @@ pub(crate) enum ConnectionCmd {
         extra_settings: Vec<(String, String)>,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Begin an INSERT session. The actor writes the Query packet
+    /// (typically `INSERT INTO ... FORMAT Native`), drains protocol
+    /// chatter until the server's schema-block Data packet arrives,
+    /// transitions to [`ActorState::InsertActive`], and replies with
+    /// the `(name, type_name)` column pairs the schema block carried.
+    /// The columns vec is `Vec::new()` on a Task-7-vintage actor when
+    /// the server's revision does not write columns into the schema
+    /// block (no live ClickHouse server does this in practice -- 25.x
+    /// always emits names + types); callers should treat an empty vec
+    /// only as a "no schema information available" signal.
+    BeginInsert {
+        query_id: String,
+        query: String,
+        extra_settings: Vec<(String, String)>,
+        reply: oneshot::Sender<Result<Vec<(String, String)>>>,
+    },
+    /// Send a single Native-format data block during an in-flight
+    /// INSERT. `column_bytes` is the pre-encoded payload from
+    /// [`crate::native::encode_columns`]; the actor is purely a
+    /// transport here, never re-encoding.
+    ///
+    /// Before writing the actor non-blockingly drains any packets the
+    /// server has already pushed (Exception from a previous block's
+    /// constraint violation, Progress / Log, etc.). An Exception
+    /// surfaced through this path aborts the INSERT before any more
+    /// bytes go on the wire -- the full-duplex correctness win the
+    /// HTTP transport cannot get.
+    SendInsertBlock {
+        column_bytes: Vec<u8>,
+        num_columns: u64,
+        num_rows: u64,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Terminate an INSERT session. The actor writes the empty-block
+    /// sentinel, drains response packets to EndOfStream (or surfaces
+    /// an Exception that arrives in between), then returns the actor
+    /// to [`ActorState::Idle`] so the connection can be reused.
+    FinishInsert { reply: oneshot::Sender<Result<()>> },
 }
 
 /// Cheap-clone send-side handle to a [`ConnectionActor`].
@@ -247,6 +315,119 @@ impl ConnectionHandle {
         rx.await
             .map_err(|_| Error::Custom("tcp: connection actor dropped execute_query reply".into()))?
     }
+
+    /// Begin an INSERT session and return the column metadata the
+    /// server echoed in its schema block.
+    ///
+    /// `query` is the full SQL text (typically
+    /// `INSERT INTO <table> FORMAT Native`). The actor sends a Query
+    /// packet, drains protocol chatter until the schema-block Data
+    /// packet arrives, transitions internal state to in-INSERT, and
+    /// replies with the schema's `(name, type_name)` pairs.
+    ///
+    /// Subsequent [`Self::send_insert_block`] calls write Native
+    /// blocks; the matching [`Self::finish_insert`] terminates the
+    /// session.
+    ///
+    /// # v1 caveat
+    ///
+    /// Servers below the custom-serialization revision (any modern
+    /// 25.x server is above it) write the schema body the same way as
+    /// the encoder shipping in Phase 2 -- (name, type, flag) per
+    /// column. The actor consumes those bytes off the wire via
+    /// [`crate::tcp::reader::read_empty_data_block_schema`] regardless
+    /// of revision; the returned vec carries exactly what the wire
+    /// carried.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor is already in `InsertActive`,
+    ///   the command channel is closed, or the reply channel was
+    ///   dropped.
+    /// - [`Error::ServerException`] if the server rejected the INSERT
+    ///   (auth, parse error, missing column, etc.) before the schema
+    ///   block.
+    /// - Any error from the underlying writer or the reader sub-task.
+    pub async fn begin_insert(
+        &self,
+        query_id: String,
+        query: String,
+        extra_settings: Vec<(String, String)>,
+    ) -> Result<Vec<(String, String)>> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::BeginInsert {
+                query_id,
+                query,
+                extra_settings,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Custom("tcp: connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("tcp: connection actor dropped begin_insert reply".into()))?
+    }
+
+    /// Send one Native-format block during an in-flight INSERT.
+    ///
+    /// `column_bytes` is the pre-encoded Native payload from
+    /// [`crate::native::encode_columns`]; the actor never re-encodes.
+    /// The actor non-blockingly drains any server-pushed packets
+    /// before writing -- a server Exception surfaced through that
+    /// drain aborts the INSERT before any more bytes go on the wire.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor is not in `InsertActive`, the
+    ///   command channel is closed, or the reply channel was dropped.
+    /// - [`Error::ServerException`] if the server emitted an Exception
+    ///   from a previous block (full-duplex detection).
+    /// - Any I/O error from the underlying writer.
+    pub async fn send_insert_block(
+        &self,
+        column_bytes: Vec<u8>,
+        num_columns: u64,
+        num_rows: u64,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::SendInsertBlock {
+                column_bytes,
+                num_columns,
+                num_rows,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Custom("tcp: connection actor closed".into()))?;
+        rx.await.map_err(|_| {
+            Error::Custom("tcp: connection actor dropped send_insert_block reply".into())
+        })?
+    }
+
+    /// Terminate an in-flight INSERT session.
+    ///
+    /// The actor writes an empty Data block (the server's INSERT
+    /// end-of-input sentinel), drains response packets to EndOfStream
+    /// or a server Exception, and returns to `Idle` so the connection
+    /// can be reused.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Custom`] if the actor is not in `InsertActive`, the
+    ///   command channel is closed, or the reply channel was dropped.
+    /// - [`Error::ServerException`] if the server rejected the INSERT
+    ///   on commit (constraint violation discovered during merge,
+    ///   etc.).
+    /// - Any I/O or drain-timeout error.
+    pub async fn finish_insert(&self) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .send(ConnectionCmd::FinishInsert { reply })
+            .await
+            .map_err(|_| Error::Custom("tcp: connection actor closed".into()))?;
+        rx.await
+            .map_err(|_| Error::Custom("tcp: connection actor dropped finish_insert reply".into()))?
+    }
 }
 
 /// Internal message type carried over the reader -> actor mpsc.
@@ -288,6 +469,9 @@ pub struct ConnectionActor {
     _reader_task: JoinHandle<()>,
     server_hello: Arc<ServerHello>,
     poisoned: Arc<AtomicBool>,
+    /// Idle or InsertActive. Gates which commands are accepted in
+    /// `CommandWorker::handle` -- see [`ActorState`] rustdoc.
+    state: ActorState,
     /// Per-packet idle read timeout; see [`ActorConfig::read_timeout`].
     read_timeout: Option<Duration>,
 }
@@ -346,6 +530,7 @@ impl ConnectionActor {
             _reader_task: reader_task,
             server_hello: Arc::clone(&server_hello),
             poisoned: Arc::clone(&poisoned),
+            state: ActorState::Idle,
             read_timeout: config.read_timeout,
         };
 
@@ -561,6 +746,203 @@ impl ConnectionActor {
         }
     }
 
+    /// Open an INSERT session: write the Query packet + empty-block
+    /// terminator, drain protocol chatter until the server emits its
+    /// schema-block Data packet, return the `(name, type_name)` pairs
+    /// it carried. The caller's `handle()` arm transitions to
+    /// `InsertActive` on success.
+    ///
+    /// The state transition is deliberately externalised so an
+    /// `Err` return (server Exception, I/O failure) leaves the actor
+    /// in `Idle` -- the connection can still be used for further
+    /// commands. On I/O failure the actor is poisoned and the pool
+    /// recycle path will drop it.
+    async fn do_begin_insert(
+        &mut self,
+        query_id: String,
+        query: String,
+        extra_settings: Vec<(String, String)>,
+    ) -> Result<Vec<(String, String)>> {
+        let major: u64 = CLIENT_VERSION_MAJOR_STR.parse().unwrap_or(0);
+        let minor: u64 = CLIENT_VERSION_MINOR_STR.parse().unwrap_or(0);
+        let mut client_info = ClientInfo::for_initial_query(
+            CLIENT_NAME,
+            major,
+            minor,
+            self.server_hello.revision,
+            "",
+        );
+        client_info.initial_query_id = query_id.clone();
+
+        // Send Query + empty-block terminator (the same shape cpp
+        // `SendQuery()` uses for INSERTs -- the empty trailing block
+        // signals end-of-prequery and prompts the server to respond
+        // with its schema block).
+        let send_result = async {
+            writer::send_query(
+                &mut self.writer,
+                self.server_hello.revision,
+                &query_id,
+                &query,
+                &extra_settings,
+                &client_info,
+            )
+            .await?;
+            writer::send_empty_block(&mut self.writer, self.server_hello.revision).await
+        }
+        .await;
+        if let Err(e) = send_result {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(e);
+        }
+
+        // Drain until the schema block (Data with num_rows == 0) or
+        // an Exception. Progress / Log / TableColumns are normal
+        // pre-schema chatter -- discard.
+        loop {
+            let msg = tokio::select! {
+                biased;
+                () = idle_timeout(self.read_timeout) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    return Err(Error::TimedOut);
+                }
+                msg = self.pkt_rx.recv() => msg,
+            };
+            match msg {
+                Some(ReaderMessage::Packet(ServerPacket::Data {
+                    num_rows, columns, ..
+                })) => {
+                    if num_rows != 0 {
+                        // A non-empty Data packet before any client
+                        // INSERT data is unexpected from the server.
+                        // Treat as protocol violation: poison and
+                        // surface so the caller doesn't sit in a
+                        // broken INSERT.
+                        self.poisoned.store(true, Ordering::Release);
+                        return Err(Error::BadResponse(format!(
+                            "tcp: server sent Data with num_rows={num_rows} \
+                             before INSERT schema block"
+                        )));
+                    }
+                    return Ok(columns);
+                }
+                Some(ReaderMessage::Packet(ServerPacket::Exception(exc))) => {
+                    return Err(exc.into_error());
+                }
+                Some(ReaderMessage::Packet(ServerPacket::EndOfStream)) => {
+                    // EndOfStream before any schema block means the
+                    // server accepted-and-finished the query without
+                    // expecting INSERT data (e.g. INSERT INTO ...
+                    // SELECT, where the server fetches data itself).
+                    // For Task 7 we treat this as a user mistake:
+                    // BeginInsert is for client-feeding INSERT only.
+                    return Err(Error::BadResponse(
+                        "tcp: server returned EndOfStream before INSERT schema block \
+                         (was this INSERT ... SELECT?)"
+                            .into(),
+                    ));
+                }
+                Some(ReaderMessage::Packet(_)) => continue,
+                Some(ReaderMessage::Error(e)) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    return Err(e);
+                }
+                None => {
+                    self.poisoned.store(true, Ordering::Release);
+                    return Err(Error::Custom(
+                        "tcp: reader sub-task exited mid begin_insert".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Send one Native block during an in-flight INSERT.
+    ///
+    /// Non-blockingly drains any packets the server has already
+    /// pushed -- a server Exception surfaces here and aborts the
+    /// INSERT before any more bytes hit the wire. This is the
+    /// full-duplex correctness path: a constraint-violating row in
+    /// block N can surface as an error on block N+1's send call
+    /// without socket teardown.
+    ///
+    /// State transitions to `Idle` only on Exception. I/O failure
+    /// poisons; successful write keeps the session in `InsertActive`.
+    async fn do_send_insert_block(
+        &mut self,
+        column_bytes: Vec<u8>,
+        num_columns: u64,
+        num_rows: u64,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        // Reject a pathologically large block before it can stall the
+        // actor on one giant socket write. The connection stays usable
+        // (nothing hit the wire) and stays in InsertActive -- the
+        // caller can re-send a smaller block or finish the INSERT.
+        if column_bytes.len() > MAX_INSERT_BLOCK_BYTES {
+            let _ = reply.send(Err(Error::Custom(format!(
+                "tcp: INSERT block of {} bytes exceeds the {MAX_INSERT_BLOCK_BYTES} byte cap; \
+                 split the batch into smaller blocks",
+                column_bytes.len()
+            ))));
+            return;
+        }
+
+        // Full-duplex check FIRST. `try_recv` is non-blocking, so we
+        // drain everything queued without waiting for new packets.
+        while let Ok(msg) = self.pkt_rx.try_recv() {
+            match msg {
+                ReaderMessage::Packet(ServerPacket::Exception(exc)) => {
+                    // Server aborted the INSERT mid-stream. The Exception
+                    // is terminal (no EndOfStream follows) and the
+                    // connection stays usable, so return to Idle and
+                    // surface the error WITHOUT draining -- a drain would
+                    // wait for an EndOfStream that never comes and stall
+                    // until DRAIN_TIMEOUT before poisoning a healthy
+                    // connection.
+                    self.state = ActorState::Idle;
+                    let _ = reply.send(Err(exc.into_error()));
+                    return;
+                }
+                ReaderMessage::Packet(_) => continue, // Progress / Log -- keep draining
+                ReaderMessage::Error(e) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    self.state = ActorState::Idle;
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+            }
+        }
+
+        let result = writer::send_data_block(
+            &mut self.writer,
+            self.server_hello.revision,
+            "",
+            &column_bytes,
+            num_columns,
+            num_rows,
+        )
+        .await;
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+            self.state = ActorState::Idle;
+        }
+        let _ = reply.send(result);
+    }
+
+    /// Terminate an INSERT session: write the empty-block sentinel,
+    /// drain response packets to EndOfStream (or surface an
+    /// Exception). Caller's `handle()` arm returns the actor to Idle
+    /// regardless of outcome.
+    async fn do_finish_insert(&mut self) -> Result<()> {
+        if let Err(e) = writer::send_empty_block(&mut self.writer, self.server_hello.revision).await
+        {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(e);
+        }
+        self.drain_to_end_of_stream().await
+    }
+
     /// Drain response packets until EndOfStream, bounded by
     /// [`DRAIN_TIMEOUT`]. Used after sending Cancel (post caller-drop)
     /// or after a server Exception so the next caller starts on a
@@ -616,8 +998,32 @@ impl CommandWorker for ConnectionActor {
     }
 
     async fn handle(&mut self, cmd: Self::Command) {
-        match cmd {
-            ConnectionCmd::Ping { reply } => {
+        // State-machine gate. The actor accepts Ping / ExecuteQuery /
+        // BeginInsert only in `Idle`; SendInsertBlock / FinishInsert
+        // only in `InsertActive`. Out-of-state commands reply with
+        // `Error::Custom`; the actor task itself stays alive so the
+        // caller can recover (e.g. issue FinishInsert to reset).
+        match (self.state, cmd) {
+            (ActorState::InsertActive, ConnectionCmd::Ping { reply }) => {
+                let _ = reply.send(Err(Error::Custom("tcp: actor busy in INSERT".into())));
+            }
+            (ActorState::InsertActive, ConnectionCmd::ExecuteQuery { reply, .. }) => {
+                let _ = reply.send(Err(Error::Custom("tcp: actor busy in INSERT".into())));
+            }
+            (ActorState::InsertActive, ConnectionCmd::BeginInsert { reply, .. }) => {
+                let _ = reply.send(Err(Error::Custom("tcp: actor already in INSERT".into())));
+            }
+            (ActorState::Idle, ConnectionCmd::SendInsertBlock { reply, .. }) => {
+                let _ = reply.send(Err(Error::Custom(
+                    "tcp: no INSERT session active".into(),
+                )));
+            }
+            (ActorState::Idle, ConnectionCmd::FinishInsert { reply }) => {
+                let _ = reply.send(Err(Error::Custom(
+                    "tcp: no INSERT session active".into(),
+                )));
+            }
+            (_, ConnectionCmd::Ping { reply }) => {
                 let result = self.do_ping().await;
                 if reply.send(result).is_err() {
                     // Caller dropped the receiver before we finished.
@@ -630,17 +1036,67 @@ impl CommandWorker for ConnectionActor {
                     );
                 }
             }
-            ConnectionCmd::ExecuteQuery {
-                query_id,
-                query,
-                extra_settings,
-                reply,
-            } => {
+            (
+                _,
+                ConnectionCmd::ExecuteQuery {
+                    query_id,
+                    query,
+                    extra_settings,
+                    reply,
+                },
+            ) => {
                 // do_execute_query owns the reply Sender for the full
                 // duration so it can watch `reply.closed()` and react
                 // to caller-side cancellation at protocol level.
                 self.do_execute_query(query_id, query, extra_settings, reply)
                     .await;
+            }
+            (
+                _,
+                ConnectionCmd::BeginInsert {
+                    query_id,
+                    query,
+                    extra_settings,
+                    reply,
+                },
+            ) => {
+                let result = self
+                    .do_begin_insert(query_id, query, extra_settings)
+                    .await;
+                if result.is_ok() {
+                    self.state = ActorState::InsertActive;
+                }
+                if reply.send(result).is_err() {
+                    tracing::warn!(
+                        target: "clickhouse::tcp",
+                        "begin_insert reply dropped by caller before send"
+                    );
+                }
+            }
+            (
+                _,
+                ConnectionCmd::SendInsertBlock {
+                    column_bytes,
+                    num_columns,
+                    num_rows,
+                    reply,
+                },
+            ) => {
+                self.do_send_insert_block(column_bytes, num_columns, num_rows, reply)
+                    .await;
+            }
+            (_, ConnectionCmd::FinishInsert { reply }) => {
+                let result = self.do_finish_insert().await;
+                // Whether finish succeeded or surfaced an Exception,
+                // the INSERT session is over -- return to Idle so the
+                // connection is reusable for non-INSERT commands.
+                self.state = ActorState::Idle;
+                if reply.send(result).is_err() {
+                    tracing::warn!(
+                        target: "clickhouse::tcp",
+                        "finish_insert reply dropped by caller before send"
+                    );
+                }
             }
         }
     }
@@ -1065,6 +1521,226 @@ mod tests {
             .await
             .expect("connection should be reusable after cancel");
         let _server = ping_server_task.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // INSERT lifecycle (BeginInsert / SendInsertBlock / FinishInsert)
+    // -----------------------------------------------------------------
+
+    /// Write a Data packet with `num_rows = 0` and the supplied
+    /// `(name, type_name)` pairs as the schema body. Matches the byte
+    /// shape the encoder produces (and the live server emits) for the
+    /// custom-serialization revision the test harness uses.
+    async fn write_schema_block(
+        server: &mut TcpStream,
+        columns: &[(&str, &str)],
+    ) {
+        server
+            .write_var_uint(ServerPacketId::Data as u64)
+            .await
+            .unwrap();
+        server.write_string(b"").await.unwrap(); // table_name
+        // Block info field pairs + terminator.
+        server.write_var_uint(1).await.unwrap();
+        AsyncWriteExt::write_u8(server, 0).await.unwrap();
+        server.write_var_uint(2).await.unwrap();
+        server.write_i32_le(-1).await.unwrap();
+        server.write_var_uint(0).await.unwrap();
+        server
+            .write_var_uint(columns.len() as u64)
+            .await
+            .unwrap();
+        server.write_var_uint(0).await.unwrap(); // num_rows
+        for (name, ty) in columns {
+            server.write_string(name.as_bytes()).await.unwrap();
+            server.write_string(ty.as_bytes()).await.unwrap();
+            // Custom-serialization flag (the test harness uses
+            // DBMS_TCP_PROTOCOL_VERSION, which is above the gate, so
+            // the encoder emits this byte and the actor's reader
+            // consumes it).
+            AsyncWriteExt::write_u8(server, 0).await.unwrap();
+        }
+        server.flush().await.unwrap();
+    }
+
+    /// Write a single server Exception packet with the supplied code +
+    /// message, and nothing after it. This is the realistic terminal
+    /// shape: a real server sends NO EndOfStream after a query
+    /// Exception, so the actor must surface the error without draining.
+    async fn write_server_exception(server: &mut TcpStream, code: i32, message: &str) {
+        server
+            .write_var_uint(ServerPacketId::Exception as u64)
+            .await
+            .unwrap();
+        server.write_i32_le(code).await.unwrap();
+        server.write_string(b"DB::Exception").await.unwrap();
+        server.write_string(message.as_bytes()).await.unwrap();
+        server.write_string(b"").await.unwrap();
+        AsyncWriteExt::write_u8(server, 0).await.unwrap(); // has_nested = false
+        server.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_state_machine_rejects_ping_when_busy() {
+        let (handle, mut server) = paired().await;
+
+        // Server side: drain the BeginInsert Query bytes, send the
+        // schema block, then hold the connection open so the actor
+        // sits in InsertActive while we issue the ping.
+        let server_task = tokio::spawn(async move {
+            let _drained = drain_client_bytes(&mut server).await;
+            write_schema_block(&mut server, &[("n", "UInt64")]).await;
+            // Hold the connection -- keep the server side alive so the
+            // ping rejection is observed before the actor sees EOF.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            server
+        });
+
+        // Drive BeginInsert; the call returns once the schema block
+        // arrives.
+        let headers = handle
+            .begin_insert("q_busy".into(), "INSERT INTO t FORMAT Native".into(), Vec::new())
+            .await
+            .expect("begin_insert should succeed against scripted server");
+        assert_eq!(
+            headers,
+            vec![("n".to_string(), "UInt64".to_string())]
+        );
+
+        // Ping while busy -- must reject without exiting InsertActive.
+        let err = handle
+            .ping()
+            .await
+            .expect_err("ping during InsertActive must error");
+        match err {
+            Error::Custom(msg) => assert!(
+                msg.contains("busy"),
+                "expected 'busy' in ping error, got {msg}"
+            ),
+            other => panic!("expected Custom busy error, got {other:?}"),
+        }
+        assert!(handle.is_alive());
+
+        let _server = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_insert_block_without_begin_errs() {
+        let (handle, _server) = paired().await;
+
+        let err = handle
+            .send_insert_block(Vec::new(), 0, 0)
+            .await
+            .expect_err("send_insert_block in Idle must error");
+        match err {
+            Error::Custom(msg) => assert!(
+                msg.contains("no INSERT session"),
+                "expected 'no INSERT session' in error, got {msg}"
+            ),
+            other => panic!("expected Custom error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_insert_returns_to_idle() {
+        let (handle, mut server) = paired().await;
+
+        // Server side: drain BeginInsert bytes, send schema block.
+        // Then drain SendInsertBlock + FinishInsert bytes, send
+        // EndOfStream so do_finish_insert returns Ok. Finally
+        // answer the post-finish Ping with Pong.
+        let server_task = tokio::spawn(async move {
+            let _drained = drain_client_bytes(&mut server).await;
+            write_schema_block(&mut server, &[("n", "UInt64")]).await;
+            // Drain SendInsertBlock + FinishInsert (just bytes; we
+            // do not parse them here).
+            let _block_bytes = drain_client_bytes(&mut server).await;
+            server
+                .write_var_uint(ServerPacketId::EndOfStream as u64)
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            // Now serve the Ping that follows: read the Ping varint
+            // and reply Pong.
+            let id = read_byte(&mut server).await;
+            assert_eq!(u64::from(id), ClientPacketId::Ping as u64);
+            server
+                .write_var_uint(ServerPacketId::Pong as u64)
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            server
+        });
+
+        let headers = handle
+            .begin_insert("q_finish".into(), "INSERT INTO t FORMAT Native".into(), Vec::new())
+            .await
+            .expect("begin_insert should succeed");
+        assert_eq!(headers.len(), 1);
+
+        // Send one (empty) block -- the actor is a transport here,
+        // it does not validate the payload.
+        handle
+            .send_insert_block(Vec::new(), 1, 0)
+            .await
+            .expect("send_insert_block should succeed");
+
+        handle
+            .finish_insert()
+            .await
+            .expect("finish_insert should return Ok on EndOfStream");
+
+        // Prove the actor returned to Idle: a Ping must now succeed.
+        handle
+            .ping()
+            .await
+            .expect("connection should be reusable after finish_insert");
+        assert!(handle.is_alive());
+
+        let _server = server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_duplex_exception_aborts_send() {
+        let (handle, mut server) = paired().await;
+
+        // Server side: drain BeginInsert bytes, send schema block, then
+        // push a single Exception (no EndOfStream after it -- the
+        // realistic terminal shape) simulating a constraint violation
+        // surfaced before the client's second SendInsertBlock.
+        let server_task = tokio::spawn(async move {
+            let _drained = drain_client_bytes(&mut server).await;
+            write_schema_block(&mut server, &[("n", "UInt64")]).await;
+            // Push an Exception "between blocks" -- give the actor a
+            // moment to handle the schema block first.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            write_server_exception(&mut server, 241, "MEMORY_LIMIT_EXCEEDED").await;
+            server
+        });
+
+        handle
+            .begin_insert("q_fd".into(), "INSERT INTO t FORMAT Native".into(), Vec::new())
+            .await
+            .expect("begin_insert should succeed");
+
+        // Wait long enough for the Exception to land in the reader's
+        // mpsc queue, then call send_insert_block -- the try_recv
+        // drain must see the Exception and abort before writing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let err = handle
+            .send_insert_block(Vec::new(), 1, 0)
+            .await
+            .expect_err("send_insert_block must surface the queued Exception");
+        match err {
+            Error::ServerException { code, .. } => assert_eq!(code, 241),
+            other => panic!("expected ServerException(241), got {other:?}"),
+        }
+
+        // Actor should be Idle again; connection still usable for
+        // non-INSERT commands.
+        assert!(handle.is_alive());
+
+        let _server = server_task.await.unwrap();
     }
 
     #[tokio::test]

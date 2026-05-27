@@ -100,6 +100,11 @@ name = "tcp_query"
 harness = false
 required-features = ["tcp", "test-util"]
 
+[[bench]]
+name = "tcp_insert"
+harness = false
+required-features = ["tcp", "lz4", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]
