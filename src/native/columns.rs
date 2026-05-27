@@ -38,11 +38,15 @@ pub enum ColumnType {
     Float64,
     /// BFloat16 -- 16-bit brain float, 2 bytes on wire.
     BFloat16,
-    /// Decimal32/64/128/256 -- wire format identical to Int32/64/128/256 (raw LE bytes).
-    Decimal32,
-    Decimal64,
-    Decimal128,
-    Decimal256,
+    /// Decimal32/64/128/256 -- wire format identical to Int32/64/128/256
+    /// (raw LE backing integer). `precision` (total significant digits)
+    /// and `scale` (fractional digits) are parsed from the type name, not
+    /// the wire; the rational value is `backing / 10^scale`. The variant
+    /// (32/64/128/256) still selects the backing-integer width.
+    Decimal32 { precision: u8, scale: u8 },
+    Decimal64 { precision: u8, scale: u8 },
+    Decimal128 { precision: u8, scale: u8 },
+    Decimal256 { precision: u8, scale: u8 },
     String,
     FixedString(usize),
     Uuid,
@@ -53,7 +57,11 @@ pub enum ColumnType {
     Date,
     Date32,
     DateTime,
-    DateTime64,
+    /// `DateTime64(precision [, timezone])` -- Int64 ticks at the given
+    /// sub-second `precision` (0..=9). `timezone` is the optional IANA
+    /// name from the type args (e.g. `'UTC'`). Both are parsed from the
+    /// type name, not the wire.
+    DateTime64 { precision: u8, timezone: Option<String> },
     /// Time -- stored as UInt32 (seconds since midnight).
     Time,
     /// Time64 -- stored as Int64 (ticks since midnight at given precision).
@@ -128,8 +136,21 @@ impl ColumnType {
             return n_str.parse::<usize>().ok().map(Self::FixedString);
         }
 
-        if type_str.starts_with("DateTime64(") {
-            return Some(Self::DateTime64);
+        if let Some(args_str) = strip_outer(type_str, "DateTime64") {
+            // DateTime64(precision) or DateTime64(precision, 'timezone').
+            let args = split_type_args(args_str);
+            let precision = args
+                .first()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(0);
+            let timezone = args
+                .get(1)
+                .map(|s| s.trim().trim_matches('\'').to_string())
+                .filter(|s| !s.is_empty());
+            return Some(Self::DateTime64 {
+                precision,
+                timezone,
+            });
         }
         if type_str.starts_with("DateTime(") {
             return Some(Self::DateTime);
@@ -138,33 +159,39 @@ impl ColumnType {
             return Some(Self::Time64);
         }
 
-        // Decimal variants -- scale is not needed for wire reading (raw LE bytes).
-        if type_str.starts_with("Decimal32(") {
-            return Some(Self::Decimal32);
+        // Sized Decimal forms take only scale; precision is implied by the
+        // backing width (Decimal32->9, 64->18, 128->38, 256->76).
+        if let Some(args) = strip_outer(type_str, "Decimal32") {
+            let scale = args.trim().parse::<u8>().unwrap_or(0);
+            return Some(Self::Decimal32 { precision: 9, scale });
         }
-        if type_str.starts_with("Decimal64(") {
-            return Some(Self::Decimal64);
+        if let Some(args) = strip_outer(type_str, "Decimal64") {
+            let scale = args.trim().parse::<u8>().unwrap_or(0);
+            return Some(Self::Decimal64 { precision: 18, scale });
         }
-        if type_str.starts_with("Decimal128(") {
-            return Some(Self::Decimal128);
+        if let Some(args) = strip_outer(type_str, "Decimal128") {
+            let scale = args.trim().parse::<u8>().unwrap_or(0);
+            return Some(Self::Decimal128 { precision: 38, scale });
         }
-        if type_str.starts_with("Decimal256(") {
-            return Some(Self::Decimal256);
+        if let Some(args) = strip_outer(type_str, "Decimal256") {
+            let scale = args.trim().parse::<u8>().unwrap_or(0);
+            return Some(Self::Decimal256 { precision: 76, scale });
         }
         // Generic Decimal(precision, scale) -- map to Decimal32/64/128/256 by precision.
         if let Some(args_str) = strip_outer(type_str, "Decimal") {
             let args = split_type_args(args_str);
             if args.len() == 2
-                && let Ok(precision) = args[0].trim().parse::<usize>()
+                && let Ok(precision) = args[0].trim().parse::<u8>()
+                && let Ok(scale) = args[1].trim().parse::<u8>()
             {
                 return Some(if precision <= 9 {
-                    Self::Decimal32
+                    Self::Decimal32 { precision, scale }
                 } else if precision <= 18 {
-                    Self::Decimal64
+                    Self::Decimal64 { precision, scale }
                 } else if precision <= 38 {
-                    Self::Decimal128
+                    Self::Decimal128 { precision, scale }
                 } else {
-                    Self::Decimal256
+                    Self::Decimal256 { precision, scale }
                 });
             }
             return None;
@@ -284,17 +311,19 @@ impl ColumnType {
             | Self::Float32
             | Self::DateTime
             | Self::Date32
-            | Self::Decimal32
+            | Self::Decimal32 { .. }
             | Self::IPv4
             | Self::Time => Some(4),
             Self::UInt64
             | Self::Int64
             | Self::Float64
-            | Self::DateTime64
-            | Self::Decimal64
+            | Self::DateTime64 { .. }
+            | Self::Decimal64 { .. }
             | Self::Time64 => Some(8),
-            Self::Int128 | Self::UInt128 | Self::Uuid | Self::IPv6 | Self::Decimal128 => Some(16),
-            Self::Int256 | Self::UInt256 | Self::Decimal256 => Some(32),
+            Self::Int128 | Self::UInt128 | Self::Uuid | Self::IPv6 | Self::Decimal128 { .. } => {
+                Some(16)
+            }
+            Self::Int256 | Self::UInt256 | Self::Decimal256 { .. } => Some(32),
             Self::FixedString(n) => Some(*n),
             Self::String
             | Self::Json
@@ -411,23 +440,23 @@ pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
             | ColumnType::Date
             | ColumnType::Date32
             | ColumnType::DateTime
-            | ColumnType::Decimal32
+            | ColumnType::Decimal32 { .. }
             | ColumnType::IPv4
             | ColumnType::Time
             | ColumnType::UInt64
             | ColumnType::Int64
             | ColumnType::Float64
-            | ColumnType::DateTime64
-            | ColumnType::Decimal64
+            | ColumnType::DateTime64 { .. }
+            | ColumnType::Decimal64 { .. }
             | ColumnType::Time64
             | ColumnType::Uuid
             | ColumnType::Int128
             | ColumnType::UInt128
             | ColumnType::IPv6
-            | ColumnType::Decimal128
+            | ColumnType::Decimal128 { .. }
             | ColumnType::Int256
             | ColumnType::UInt256
-            | ColumnType::Decimal256 => {
+            | ColumnType::Decimal256 { .. } => {
                 let size = col_type.fixed_size().expect("size is known for fixed type");
                 read_fixed_column(reader, n, size).await
             }
@@ -1316,10 +1345,12 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
             ((bytes[0] as i8).to_string().into_bytes(), 1)
         }
         ColumnType::Int16 => fixed!(2, i16, "{}"),
-        ColumnType::Int32 | ColumnType::Decimal32 => fixed!(4, i32, "{}"),
+        ColumnType::Int32 | ColumnType::Decimal32 { .. } => fixed!(4, i32, "{}"),
         ColumnType::Date32 => fixed!(4, i32, "{}"),
-        ColumnType::Int64 | ColumnType::Time64 | ColumnType::Decimal64 => fixed!(8, i64, "{}"),
-        ColumnType::Int128 | ColumnType::Decimal128 => {
+        ColumnType::Int64 | ColumnType::Time64 | ColumnType::Decimal64 { .. } => {
+            fixed!(8, i64, "{}")
+        }
+        ColumnType::Int128 | ColumnType::Decimal128 { .. } => {
             if bytes.len() < 16 {
                 return Err(());
             }
@@ -1333,7 +1364,7 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
             let v = u128::from_le_bytes(bytes[..16].try_into().unwrap());
             (v.to_string().into_bytes(), 16)
         }
-        ColumnType::Int256 | ColumnType::UInt256 | ColumnType::Decimal256 => {
+        ColumnType::Int256 | ColumnType::UInt256 | ColumnType::Decimal256 { .. } => {
             // 32-byte big integer -- emit as hex string for safety
             if bytes.len() < 32 {
                 return Err(());
@@ -1375,7 +1406,7 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
             let days = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
             (format!("\"{days}\"").into_bytes(), 2)
         }
-        ColumnType::DateTime | ColumnType::DateTime64 => {
+        ColumnType::DateTime | ColumnType::DateTime64 { .. } => {
             let size = col_type.fixed_size().unwrap_or(4);
             if bytes.len() < size {
                 return Err(());

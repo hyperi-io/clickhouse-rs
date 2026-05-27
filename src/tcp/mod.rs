@@ -34,6 +34,7 @@
 pub(crate) mod client_info;
 pub mod connect;
 pub mod connection_actor;
+pub mod cursor;
 pub mod handshake;
 pub(crate) mod protocol;
 pub(crate) mod reader;

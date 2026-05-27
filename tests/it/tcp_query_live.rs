@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 
 use clickhouse::HandshakeConfig;
 use clickhouse::error::Error;
+use clickhouse::native::DecodedColumn;
 use clickhouse::tcp::connect::{ConnectKind, open_handshaken};
 use clickhouse::tcp::connection_actor::{ConnectionActor, ConnectionHandle};
 
@@ -119,4 +120,90 @@ async fn cancel_on_reply_drop_releases_connection() {
         .execute_query("rs_post_cancel".into(), "SELECT 1".into(), Vec::new())
         .await
         .expect("connection should be reusable after cancel-on-drop");
+}
+
+#[tokio::test]
+#[ignore = "requires CLICKHOUSE_TCP_URL env var pointing at a live ClickHouse server"]
+async fn stream_10k_rows() {
+    let handle = live_handle().await;
+
+    let mut cursor = handle
+        .execute_stream_cursor(
+            "rs_stream_10k".into(),
+            "SELECT number FROM numbers(10000)".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("execute_stream_cursor should succeed");
+
+    let mut sum: u64 = 0;
+    let mut row_count: u64 = 0;
+    while let Some(block) = cursor.next_block().await.expect("block decode") {
+        // Schema block has num_rows = 0; payload blocks carry the
+        // UInt64 column with row data.
+        if block.num_rows == 0 {
+            continue;
+        }
+        row_count += block.num_rows;
+        match &block.columns[0] {
+            DecodedColumn::UInt64(values) => sum += values.iter().sum::<u64>(),
+            other => panic!("expected UInt64 column, got {other:?}"),
+        }
+    }
+    assert_eq!(row_count, 10_000);
+    assert_eq!(sum, (0u64..10_000).sum::<u64>());
+    assert!(handle.is_alive());
+}
+
+#[tokio::test]
+#[ignore = "requires CLICKHOUSE_TCP_URL env var pointing at a live ClickHouse server"]
+async fn drop_cursor_mid_stream_releases_connection() {
+    let handle = live_handle().await;
+
+    {
+        let mut cursor = handle
+            .execute_stream_cursor(
+                "rs_stream_long".into(),
+                // ~10M rows is enough that we definitely drop the
+                // cursor before the server has finished streaming;
+                // numbers() is cheap server-side but the wire is the
+                // bottleneck.
+                "SELECT number FROM numbers(10000000)".into(),
+                Vec::new(),
+            )
+            .await
+            .expect("execute_stream_cursor should succeed");
+
+        // Pull a small number of blocks then drop the cursor. The
+        // first block is the schema block; pull a couple of payload
+        // blocks beyond that.
+        let mut payload_blocks_seen = 0;
+        while payload_blocks_seen < 3 {
+            let block = cursor.next_block().await.expect("block").expect("block");
+            if block.num_rows > 0 {
+                payload_blocks_seen += 1;
+            }
+        }
+        // cursor falls out of scope here -> rx drops -> actor's
+        // do_execute_stream sees results.closed() and sends Cancel.
+    }
+
+    // Give the actor time to Cancel + drain the server's mid-stream
+    // response before we issue the next query on the same handle.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(
+        handle.is_alive(),
+        "connection should remain alive after cursor drop"
+    );
+
+    // Reuse: a fresh query must succeed on the same socket.
+    handle
+        .execute_query(
+            "rs_post_stream_drop".into(),
+            "SELECT 1".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("connection should be reusable after cursor drop");
 }

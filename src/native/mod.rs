@@ -60,6 +60,7 @@ pub mod block_info;
 pub mod columns;
 #[cfg(feature = "lz4")]
 pub mod compression;
+pub(crate) mod decode;
 pub mod encode;
 pub mod io;
 pub mod sparse;
@@ -69,3 +70,14 @@ pub mod sparse;
 pub use block_info::BlockInfo;
 pub use columns::ColumnType;
 pub use encode::{ColumnSchema, encode_columns};
+
+// Decoder primitives -- in-tree consumers are the TCP cursor in
+// src/tcp/cursor.rs, the streaming actor in src/tcp/connection_actor.rs,
+// and the reader in src/tcp/reader.rs. `decode_block` stays
+// pub(crate) -- it's the reader sub-task's entry point and not
+// useful directly to external code -- but the decoded types are
+// part of the streaming surface that callers iterate, so they are
+// re-exported here.
+#[allow(unused_imports)]
+pub(crate) use decode::decode_block;
+pub use decode::{DecodedBlock, DecodedColumn};

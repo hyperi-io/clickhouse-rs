@@ -105,6 +105,11 @@ name = "tcp_insert"
 harness = false
 required-features = ["tcp", "lz4", "test-util"]
 
+[[bench]]
+name = "native_decode"
+harness = false
+required-features = ["tcp", "lz4", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]

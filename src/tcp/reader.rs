@@ -11,17 +11,27 @@
 //! supplies fixed-width LE reads on the same trait object. No new
 //! io.rs in this module.
 //!
-//! Data packets surface header-only -- `(table_name, num_columns,
-//! num_rows)`. The column-bytes payload is decoded by the cursor
-//! that lands alongside the connection actor in a subsequent
-//! branch, using [`crate::native::decode`]. Keeping the payload
-//! out of this layer keeps the reader transport-only and avoids
-//! buffering an entire Data block in memory before the cursor can
-//! stream it.
+//! Data packets carry either a schema block (`num_rows == 0`) or a
+//! payload block (`num_rows > 0`). Schema blocks surface their
+//! `(name, type_name)` column pairs in
+//! [`ServerPacket::Data::columns`]; payload blocks are fully decoded
+//! inline through [`crate::native::decode::decode_block`] and surface
+//! as [`ServerPacket::DataBlock`]. Decoding inline -- inside the
+//! reader sub-task -- is the only way the actor can advance past a
+//! payload block without misaligning the next packet's leading
+//! varuint: the column bytes are byte-after-byte interleaved with the
+//! block header, so an out-of-band consumer would race the next
+//! `read_packet` call. The telemetry `ProfileEvents` packet carries a
+//! leading string plus a Native block and is read-and-discarded inline
+//! for the same reason: the server emits it during normal query
+//! execution, so its bytes must be consumed to keep the stream
+//! aligned. Compressed blocks remain a Phase 3.5 concern; v1
+//! negotiates `NativeCompressionMethod::None`.
 
 use tokio::io::AsyncReadExt;
 
 use crate::error::{Error, Result};
+use crate::native::decode::{DecodedBlock, decode_block};
 use crate::native::io::ClickHouseRead;
 use crate::tcp::protocol::{
     DBMS_MIN_REVISION_WITH_BLOCK_INFO, DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO,
@@ -53,40 +63,46 @@ pub(crate) const DBMS_MIN_REVISION_WITH_TOTAL_ROWS_IN_PROGRESS: u64 = 51554;
 /// column metadata consumed off the wire and surfaced in `columns`.
 /// For data blocks with `num_rows > 0` the column payload is left in
 /// the reader; the cursor + Native decoder in Task 8 consumes it.
-/// `Log` and `ProfileEvents` discard their block payloads at the
-/// reader -- the connection actor records them via `tracing` but
-/// does not surface them to callers.
+/// `Log` and `ProfileEvents` blocks are both read-and-discarded at the
+/// reader (their bytes must be consumed to keep the stream aligned, but
+/// their contents are not surfaced to callers in v1).
 #[derive(Debug)]
 pub(crate) enum ServerPacket {
-    /// Data block header (+ schema metadata for empty blocks).
+    /// Schema block (Data packet with `num_rows == 0`).
     ///
     /// `table_name` is the empty string for default-target INSERTs;
     /// servers below `DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES` (50264)
     /// omit it on the wire (the field is `None` in that case).
-    /// `columns` is non-empty only for the INSERT schema block
-    /// (num_rows == 0); for streaming SELECT blocks the field is an
-    /// empty vec and the column bytes remain in the reader for the
-    /// Task-8 cursor to decode.
+    /// `columns` carries the `(name, type_name)` pairs the server
+    /// echoed for the upcoming INSERT or SELECT stream. Payload
+    /// blocks surface separately as [`ServerPacket::DataBlock`].
     Data {
         table_name: Option<String>,
         num_columns: u64,
         num_rows: u64,
         columns: Vec<(String, String)>,
     },
+    /// Fully decoded payload block (`num_rows > 0`). The column-bytes
+    /// payload was consumed inline by
+    /// [`crate::native::decode::decode_block`]; downstream cursors
+    /// iterate rows out of the [`DecodedBlock`] directly. Decoding
+    /// inline is the only way to keep the reader's stream pointer
+    /// aligned against the next packet.
+    DataBlock(DecodedBlock),
     Exception(Exception),
     Progress(Progress),
     ProfileInfo(ProfileInfo),
     Pong,
     EndOfStream,
-    /// Server-log packet. This client never requests log forwarding
-    /// (`send_logs_level` is left unset), so `read_packet` rejects an
-    /// unsolicited Log packet as a protocol error rather than
-    /// producing this variant. Retained so the actor's match arms stay
-    /// exhaustive and to reserve the shape for a future log-forwarding
-    /// feature.
+    /// Server-log packet (sent when the caller set `send_logs_level`,
+    /// which is forwarded onto the TCP Query). Its leading tag string +
+    /// Native block are read and discarded at this layer to keep the
+    /// stream aligned; the log lines are not surfaced to callers in v1.
     Log,
     TableColumns(TableColumns),
-    /// ProfileEvents payload is read and discarded at this layer.
+    /// ProfileEvents telemetry. The packet's leading string + Native
+    /// block are read and discarded at this layer to keep the stream
+    /// aligned; the event values are not surfaced to callers.
     ProfileEvents,
     /// Timezone update string sent mid-stream when the server's
     /// session timezone changes.
@@ -376,6 +392,32 @@ pub(crate) async fn read_empty_data_block_schema<R: ClickHouseRead>(
     Ok(out)
 }
 
+/// Read and discard a server telemetry block (`Log` / `ProfileEvents`).
+///
+/// Both packets are framed as one leading length-prefixed string (the
+/// log tag / host name) followed by a Native block -- cpp-client's
+/// `ReceivePacket` handles both with `SkipString` + `ReadBlock`, and
+/// clickhouse-go likewise reads-and-drops them.
+/// [`read_data_block_header`] consumes the leading string in its
+/// table-name slot (valid because this client always negotiates a
+/// revision at or above `DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES`
+/// (50264), so the slot is read) plus the block header; the block body
+/// is then consumed and its decoded values dropped. The bytes MUST be
+/// read or the next packet's leading varuint misaligns. v1 does not
+/// surface log lines or profile events to callers.
+async fn consume_telemetry_block<R: ClickHouseRead>(
+    r: &mut R,
+    server_revision: u64,
+) -> Result<()> {
+    let (_tag, num_columns, num_rows) = read_data_block_header(r, server_revision).await?;
+    if num_rows == 0 {
+        let _ = read_empty_data_block_schema(r, num_columns, server_revision).await?;
+    } else {
+        let _ = decode_block(r, num_columns, num_rows, server_revision).await?;
+    }
+    Ok(())
+}
+
 /// Dispatch a single server packet. Reads the leading varint
 /// packet ID and dispatches to the per-packet decoder. Unknown
 /// IDs return [`Error::BadResponse`] via
@@ -385,9 +427,9 @@ pub(crate) async fn read_empty_data_block_schema<R: ClickHouseRead>(
 /// block) the body's `(name, type_name)` pairs are consumed via
 /// [`read_empty_data_block_schema`] and exposed in
 /// `ServerPacket::Data::columns`. For `num_rows > 0` the column-
-/// bytes payload is *not* consumed here; the Task-8 cursor must
-/// consume it from the same reader before requesting the next
-/// packet or the stream pointer will misalign.
+/// bytes payload is consumed inline via
+/// [`crate::native::decode::decode_block`] and surfaced as
+/// [`ServerPacket::DataBlock`].
 pub(crate) async fn read_packet<R: ClickHouseRead>(
     r: &mut R,
     server_revision: u64,
@@ -395,20 +437,27 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
     let packet_type = r.read_var_uint().await?;
     let id = ServerPacketId::from_u64(packet_type)?;
     match id {
-        ServerPacketId::Data => {
+        // Totals (WITH TOTALS) and Extremes (extremes=1) are Native
+        // result blocks framed identically to Data (cpp `ReceivePacket`
+        // + clickhouse-go decode them the same way). Decode them through
+        // the Data path so a `WITH TOTALS` / `extremes=1` query does not
+        // poison the connection; they flow to the cursor as data blocks.
+        ServerPacketId::Data | ServerPacketId::Totals | ServerPacketId::Extremes => {
             let (table_name, num_columns, num_rows) =
                 read_data_block_header(r, server_revision).await?;
-            let columns = if num_rows == 0 {
-                read_empty_data_block_schema(r, num_columns, server_revision).await?
+            if num_rows == 0 {
+                let columns =
+                    read_empty_data_block_schema(r, num_columns, server_revision).await?;
+                Ok(ServerPacket::Data {
+                    table_name,
+                    num_columns,
+                    num_rows,
+                    columns,
+                })
             } else {
-                Vec::new()
-            };
-            Ok(ServerPacket::Data {
-                table_name,
-                num_columns,
-                num_rows,
-                columns,
-            })
+                let block = decode_block(r, num_columns, num_rows, server_revision).await?;
+                Ok(ServerPacket::DataBlock(block))
+            }
         }
         ServerPacketId::Exception => Ok(ServerPacket::Exception(read_exception(r).await?)),
         ServerPacketId::Progress => Ok(ServerPacket::Progress(
@@ -417,22 +466,31 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
         ServerPacketId::ProfileInfo => Ok(ServerPacket::ProfileInfo(read_profile_info(r).await?)),
         ServerPacketId::Pong => Ok(ServerPacket::Pong),
         ServerPacketId::EndOfStream => Ok(ServerPacket::EndOfStream),
-        ServerPacketId::Log => Err(Error::BadResponse(
-            "tcp: server sent an unsolicited Log packet (this client does not \
-             request server-log forwarding)"
-                .into(),
-        )),
+        ServerPacketId::Log => {
+            // The server sends Log packets when the caller requested
+            // them via the `send_logs_level` setting (which apps may set
+            // globally and which is forwarded onto the TCP Query). Both
+            // upstream clients consume the block; rejecting it would
+            // poison every query under such a setting. Consume + drop;
+            // surfacing log lines to callers is a follow-up.
+            consume_telemetry_block(r, server_revision).await?;
+            Ok(ServerPacket::Log)
+        }
         ServerPacketId::TableColumns => Ok(ServerPacket::TableColumns(
             read_table_columns(r).await?,
         )),
-        ServerPacketId::ProfileEvents => Ok(ServerPacket::ProfileEvents),
+        ServerPacketId::ProfileEvents => {
+            // Sent during normal query execution (rev >= 54451, always
+            // negotiated). Same string + Native block framing as Log.
+            consume_telemetry_block(r, server_revision).await?;
+            Ok(ServerPacket::ProfileEvents)
+        }
         ServerPacketId::TimezoneUpdate => Ok(ServerPacket::TimezoneUpdate(
             r.read_utf8_string().await?,
         )),
-        // Totals, Extremes, Hello mid-stream are all unexpected
-        // after the handshake; surface as BadResponse rather than
-        // silently advancing the stream pointer past unknown
-        // payload bytes.
+        // A mid-stream Hello (or any other unexpected id) is a protocol
+        // surprise; surface as BadResponse rather than silently
+        // advancing the stream pointer past unknown payload bytes.
         other => Err(Error::BadResponse(format!(
             "tcp: unexpected server packet {other:?} mid-stream"
         ))),
@@ -579,23 +637,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_packet_rejects_unsolicited_log() {
-        // This client never requests server-log forwarding, so a Log
-        // packet is a protocol surprise: surface it as BadResponse
-        // rather than silently misaligning the stream.
-        let mut buf = Vec::new();
-        buf.write_var_uint(ServerPacketId::Log as u64).await.unwrap();
-        let mut cur = Cursor::new(buf);
-        let err = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
-            .await
-            .unwrap_err();
-        match err {
-            Error::BadResponse(msg) => assert!(msg.contains("Log packet"), "got: {msg}"),
-            other => panic!("expected BadResponse, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn read_packet_consumes_empty_data_block_schema() {
         // The server's INSERT schema block: Data packet, table_name = "",
         // block-info, num_columns = 2, num_rows = 0, then per-column
@@ -650,6 +691,132 @@ mod tests {
         }
         // The trailing EndOfStream must still be readable -- proves the
         // schema-block consume left the stream pointer aligned.
+        let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(trailing, ServerPacket::EndOfStream));
+    }
+
+    #[tokio::test]
+    async fn read_packet_consumes_profile_events_block() {
+        // ProfileEvents framing: packet id, a leading host/tag string,
+        // then a Native block (block-info, num_columns, num_rows,
+        // per-column name/type/flag/data). The reader must consume the
+        // whole thing so the next packet stays aligned. One UInt64
+        // column, one row, value 42.
+        let mut buf = Vec::new();
+        buf.write_var_uint(ServerPacketId::ProfileEvents as u64)
+            .await
+            .unwrap();
+        buf.write_string(b"host-01").await.unwrap(); // leading tag
+        // Block info.
+        buf.write_var_uint(1).await.unwrap();
+        buf.write_u8(0).await.unwrap();
+        buf.write_var_uint(2).await.unwrap();
+        buf.write_i32_le(-1).await.unwrap();
+        buf.write_var_uint(0).await.unwrap();
+        buf.write_var_uint(1).await.unwrap(); // num_columns
+        buf.write_var_uint(1).await.unwrap(); // num_rows
+        buf.write_string(b"value").await.unwrap(); // col name
+        buf.write_string(b"UInt64").await.unwrap(); // type
+        buf.write_u8(0).await.unwrap(); // custom-serialization flag
+        buf.write_u64_le(42).await.unwrap(); // the one row's value
+        // Trailing sentinel.
+        buf.write_var_uint(ServerPacketId::EndOfStream as u64)
+            .await
+            .unwrap();
+
+        let mut cur = Cursor::new(buf);
+        let pkt = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(pkt, ServerPacket::ProfileEvents));
+        // The block bytes were consumed: the trailing EndOfStream reads
+        // cleanly. Before the fix this misaligned on the first
+        // ProfileEvents packet of any live query.
+        let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(trailing, ServerPacket::EndOfStream));
+    }
+
+    #[tokio::test]
+    async fn read_packet_consumes_log_block() {
+        // A Log packet is framed exactly like ProfileEvents (leading tag
+        // string + Native block) and must be consumed so the stream
+        // stays aligned -- an app that set send_logs_level would
+        // otherwise poison every TCP query. One String column, one row.
+        let mut buf = Vec::new();
+        buf.write_var_uint(ServerPacketId::Log as u64).await.unwrap();
+        buf.write_string(b"log-tag").await.unwrap(); // leading tag
+        // Block info.
+        buf.write_var_uint(1).await.unwrap();
+        buf.write_u8(0).await.unwrap();
+        buf.write_var_uint(2).await.unwrap();
+        buf.write_i32_le(-1).await.unwrap();
+        buf.write_var_uint(0).await.unwrap();
+        buf.write_var_uint(1).await.unwrap(); // num_columns
+        buf.write_var_uint(1).await.unwrap(); // num_rows
+        buf.write_string(b"text").await.unwrap(); // col name
+        buf.write_string(b"String").await.unwrap(); // type
+        buf.write_u8(0).await.unwrap(); // custom-serialization flag
+        buf.write_string(b"hello from server").await.unwrap(); // the row value
+        // Trailing sentinel proves the block was fully consumed.
+        buf.write_var_uint(ServerPacketId::EndOfStream as u64)
+            .await
+            .unwrap();
+
+        let mut cur = Cursor::new(buf);
+        let pkt = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(pkt, ServerPacket::Log));
+        let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(trailing, ServerPacket::EndOfStream));
+    }
+
+    #[tokio::test]
+    async fn read_packet_decodes_totals_block_then_eos() {
+        // A `WITH TOTALS` query emits a Totals packet (id 7) framed
+        // exactly like Data: table_name, block-info, num_columns,
+        // num_rows, then the column payload. The reader must decode it
+        // (as a DataBlock) so the query does not poison the connection,
+        // and leave the stream aligned for the trailing EndOfStream.
+        // One UInt64 column, one totals row = 99.
+        let mut buf = Vec::new();
+        buf.write_var_uint(ServerPacketId::Totals as u64).await.unwrap();
+        buf.write_string(b"").await.unwrap(); // table_name
+        buf.write_var_uint(1).await.unwrap(); // block-info field 1
+        buf.write_u8(0).await.unwrap();
+        buf.write_var_uint(2).await.unwrap(); // block-info field 2
+        buf.write_i32_le(-1).await.unwrap();
+        buf.write_var_uint(0).await.unwrap(); // terminator
+        buf.write_var_uint(1).await.unwrap(); // num_columns
+        buf.write_var_uint(1).await.unwrap(); // num_rows
+        buf.write_string(b"total").await.unwrap(); // col name
+        buf.write_string(b"UInt64").await.unwrap(); // type
+        buf.write_u8(0).await.unwrap(); // custom-serialization flag
+        buf.write_u64_le(99).await.unwrap(); // the totals row
+        buf.write_var_uint(ServerPacketId::EndOfStream as u64)
+            .await
+            .unwrap();
+
+        let mut cur = Cursor::new(buf);
+        let pkt = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        match pkt {
+            ServerPacket::DataBlock(block) => {
+                assert_eq!(block.num_rows, 1);
+                match &block.columns[0] {
+                    crate::native::decode::DecodedColumn::UInt64(v) => assert_eq!(v, &vec![99u64]),
+                    other => panic!("expected UInt64 totals, got {other:?}"),
+                }
+            }
+            other => panic!("expected DataBlock for Totals, got {other:?}"),
+        }
         let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
             .await
             .unwrap();
