@@ -290,6 +290,8 @@ mod table_engine;
 mod table_engine_live;
 #[cfg(feature = "tcp")]
 mod tcp_handshake_live;
+#[cfg(feature = "tcp")]
+mod tcp_query_live;
 mod time;
 mod user_agent;
 mod uuid;

@@ -33,7 +33,7 @@
 
 pub(crate) mod client_info;
 pub mod connect;
-pub(crate) mod connection_actor;
+pub mod connection_actor;
 pub mod handshake;
 pub(crate) mod protocol;
 pub(crate) mod reader;

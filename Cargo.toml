@@ -95,6 +95,11 @@ name = "tcp_handshake"
 harness = false
 required-features = ["tcp", "test-util"]
 
+[[bench]]
+name = "tcp_query"
+harness = false
+required-features = ["tcp", "test-util"]
+
 [[example]]
 name = "inserter"
 required-features = ["inserter"]
