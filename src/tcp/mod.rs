@@ -14,12 +14,15 @@
 //!   and `open_handshaken` (connect + handshake) entry points.
 //! - [`handshake`] -- `HandshakeConfig` + `handshake()` orchestrator
 //!   driving send-Hello / recv-ServerHello / send-addendum.
+//! - [`connection_actor`] -- `CommandWorker` impl owning the writer half
+//!   and a packet-receiver fed by an independent reader sub-task;
+//!   `ConnectionHandle` is the cheap-clone send-side.
 //!
 //! Wire-format primitives (varint, length-prefixed string, fixed-width
 //! LE) come from [`crate::native::io`]; this module does not duplicate
 //! them. The Native columnar encoder / decoder also lives under
-//! [`crate::native`]. Connection actor, handshake, pool, and `Client`
-//! integration land in subsequent branches.
+//! [`crate::native`]. Pool and `Client` integration land in subsequent
+//! branches.
 
 // The protocol staging types and transport adapter are wired by the
 // handshake, writer, reader, and actor branches that follow. The
@@ -30,6 +33,7 @@
 
 pub(crate) mod client_info;
 pub mod connect;
+pub(crate) mod connection_actor;
 pub mod handshake;
 pub(crate) mod protocol;
 pub(crate) mod reader;
