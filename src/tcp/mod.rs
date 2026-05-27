@@ -17,6 +17,9 @@
 //! - [`connection_actor`] -- `CommandWorker` impl owning the writer half
 //!   and a packet-receiver fed by an independent reader sub-task;
 //!   `ConnectionHandle` is the cheap-clone send-side.
+//! - [`pool`] -- `TcpConnectionManager` + `NativePool` (deadpool managed
+//!   pool) with poison-on-error recycle; the only construction site for
+//!   `ConnectionHandle`s outside tests once `Client::tcp` lands.
 //!
 //! Wire-format primitives (varint, length-prefixed string, fixed-width
 //! LE) come from [`crate::native::io`]; this module does not duplicate
@@ -36,6 +39,7 @@ pub mod connect;
 pub mod connection_actor;
 pub mod cursor;
 pub mod handshake;
+pub(crate) mod pool;
 pub(crate) mod protocol;
 pub(crate) mod reader;
 pub(crate) mod transport;
