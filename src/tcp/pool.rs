@@ -115,6 +115,10 @@ pub(crate) struct TcpConnectionManager {
     /// because `create` takes `&self`. Wrapping at `usize::MAX` is
     /// harmless -- the value is only ever used modulo `endpoints.len()`.
     pub next: Arc<AtomicUsize>,
+    /// Plain TCP vs TLS selection. Carries the SNI on the TLS arm so
+    /// the manager re-uses the same name across reconnects without
+    /// having to re-derive it from the address.
+    pub kind: ConnectKind,
     /// Handshake parameters (database, credentials, client name,
     /// chunked-mode preference). Cloned into each `create` call so
     /// the manager itself stays cheap to share across the pool.
@@ -169,7 +173,7 @@ impl managed::Manager for TcpConnectionManager {
                     continue;
                 }
             };
-            match connect::open_handshaken(addr, &ConnectKind::Plain, &self.config).await {
+            match connect::open_handshaken(addr, &self.kind, &self.config).await {
                 Ok((stream, hello)) => {
                     return Ok(ConnectionActor::spawn_with_config(
                         stream,
@@ -284,11 +288,14 @@ pub(crate) struct TcpClientConfig {
     /// Candidate server addresses as the caller supplied them.
     /// Resolved at pool-build time, not at `Client::tcp` time, so a
     /// hostname that gains new A records after construction picks them
-    /// up on rebuild. `Client::tcp` sets a single-element list;
-    /// `with_tcp_addrs` replaces it with the full list. A
+    /// up on rebuild. `Client::tcp` / `tcp_tls` set a single-element
+    /// list; `with_tcp_addrs` replaces it with the full list. A
     /// default-constructed config (HTTP clients) leaves it empty; the
     /// TCP pool is only built once a constructor has populated it.
     pub endpoints: Vec<String>,
+    /// Plain vs TLS transport selection. Defaults to `Plain`; set by
+    /// `Client::tcp_tls` under the `native-tls-rustls` feature.
+    pub kind: ConnectKindConfig,
     /// Handshake parameters (database, credentials, quota_key).
     pub handshake: HandshakeConfig,
     /// Pool dials.
@@ -300,6 +307,26 @@ pub(crate) struct TcpClientConfig {
     /// [`crate::tcp::client_ext`], so changing it does NOT require a
     /// pool rebuild.
     pub retry: Option<RetryPolicy>,
+}
+
+/// Cargo-feature-independent mirror of [`ConnectKind`].
+///
+/// `ConnectKind` itself feature-gates its `Tls` arm so a build
+/// without `native-tls-rustls` cannot construct it. `Client` holds
+/// the choice unconditionally so its struct shape is identical
+/// across feature configurations -- the conversion to `ConnectKind`
+/// happens at pool-build time, where the feature gate is in scope.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ConnectKindConfig {
+    #[default]
+    Plain,
+    /// TLS over TCP. Held even when `native-tls-rustls` is off so the
+    /// struct layout stays stable; pool build then returns an error
+    /// if the feature is missing rather than silently downgrading to
+    /// plain.
+    Tls {
+        server_name: String,
+    },
 }
 
 /// Build a TCP connection pool over the supplied endpoint list,
@@ -323,18 +350,79 @@ pub(crate) struct TcpClientConfig {
 /// the error explicitly so a future deadpool revision that adds new
 /// build failures still surfaces as a typed crate error rather than
 /// a panic.
+/// Build-time TLS intent for the TCP pool's connect path.
+///
+/// Distinguishes "no trust was configured" (-> default anchors are fine)
+/// from "a trust WAS configured but could not be resolved" (-> fail
+/// closed, never silently fall back to broad default trust). Carried as
+/// a build-time-only input rather than on `PoolConfig` because it is not
+/// a runtime dial.
+#[cfg(feature = "native-tls-rustls")]
+pub(crate) enum TcpTls {
+    /// Caller never customised trust. The TLS arm resolves the default
+    /// native+webpki anchors (happy path).
+    NotConfigured,
+    /// A trust was configured and resolved to this config.
+    Resolved(std::sync::Arc<tokio_rustls::rustls::ClientConfig>),
+    /// A trust WAS configured but failed to resolve. Refuse to build a
+    /// TLS pool rather than fall back to broad default trust.
+    ConfiguredButFailed,
+}
+
 pub(crate) fn build_pool(
     endpoints: Vec<String>,
+    kind: ConnectKindConfig,
     config: HandshakeConfig,
     pool_cfg: PoolConfig,
+    // Build-time TLS intent from the `Client` (its `with_tls_*`
+    // builders, or `with_tls_config`). See [`TcpTls`]. Carried as a
+    // separate arg rather than on `PoolConfig` because it is a build-
+    // time-only input, not a runtime dial.
+    #[cfg(feature = "native-tls-rustls")] tls: TcpTls,
 ) -> Result<NativePool> {
     assert!(
         !endpoints.is_empty(),
         "build_pool requires a non-empty endpoint list"
     );
+    let kind = match kind {
+        ConnectKindConfig::Plain => ConnectKind::Plain,
+        // Resolve the shared trust to one ClientConfig at pool build.
+        // Fail-closed: a configured-but-unresolved trust must NOT fall
+        // back to default anchors (that would silently broaden trust).
+        // It builds a TlsFailClosed pool rather than erroring here, so a
+        // builder chain like `tcp_tls().with_tls_roots_exclusive()
+        // .try_with_tls_root_ca(..)` does not panic on the transient
+        // unresolved state -- the refusal surfaces at connect time, never
+        // as a silent downgrade to plain/HTTP or to default trust.
+        #[cfg(feature = "native-tls-rustls")]
+        ConnectKindConfig::Tls { server_name } => match tls {
+            TcpTls::Resolved(config) => ConnectKind::Tls {
+                server_name,
+                config,
+            },
+            TcpTls::NotConfigured => {
+                let config = crate::tls::build_client_config(
+                    &crate::tls::TlsConfigSource::Trust(crate::tls::TlsTrust::default()),
+                )?;
+                ConnectKind::Tls {
+                    server_name,
+                    config,
+                }
+            }
+            TcpTls::ConfiguredButFailed => ConnectKind::TlsFailClosed,
+        },
+        #[cfg(not(feature = "native-tls-rustls"))]
+        ConnectKindConfig::Tls { .. } => {
+            return Err(Error::Custom(
+                "tcp: TLS requested but the `native-tls-rustls` feature is not enabled"
+                    .into(),
+            ));
+        }
+    };
     let manager = TcpConnectionManager {
         endpoints,
         next: Arc::new(AtomicUsize::new(0)),
+        kind,
         config,
         max_lifetime: pool_cfg.max_lifetime,
         read_timeout: pool_cfg.read_timeout,
@@ -682,14 +770,10 @@ mod tests {
     /// the round-robin cursor seeded at 0 so the first `create` starts
     /// on endpoint 0.
     fn manager_over(endpoints: Vec<String>) -> TcpConnectionManager {
-        // `ConnectKind` is referenced here only to document intent --
-        // this branch's `create` is hard-wired to `ConnectKind::Plain`
-        // (the TLS arm lands on a later branch), so the manager carries
-        // no `kind` field yet.
-        let _ = ConnectKind::Plain;
         TcpConnectionManager {
             endpoints,
             next: Arc::new(AtomicUsize::new(0)),
+            kind: ConnectKind::Plain,
             config: HandshakeConfig::default(),
             max_lifetime: None,
             read_timeout: None,
@@ -769,27 +853,41 @@ mod tests {
             Err(e) => e,
         };
         // A refused connect round-trips io::Error -> Error::Other; the
-        // surfaced error must carry that transient connect kind so a
-        // later retry-classification branch can treat it as retriable.
-        match &err {
-            Error::Other(boxed) => {
-                let io = boxed
-                    .downcast_ref::<std::io::Error>()
-                    .expect("a refused connect should surface as Error::Other(io::Error)");
-                assert!(
-                    matches!(
-                        io.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::ConnectionAborted
-                    ),
-                    "all-endpoints-refused should surface a transient connect kind, got {:?}",
-                    io.kind()
-                );
-            }
-            other => panic!(
-                "all-endpoints-refused connect error should be Error::Other(io::Error), got {other:?}"
-            ),
-        }
+        // classifier must treat it as a retriable transport failure.
+        assert!(
+            crate::tcp::retry::is_retriable_transport(&err),
+            "an all-endpoints-refused connect error should be retriable, got {err:?}"
+        );
+    }
+
+    /// Fail-closed: a TLS pool whose trust was configured but failed to
+    /// resolve (`TcpTls::ConfiguredButFailed`) BUILDS (so a transient
+    /// unresolved state mid-builder-chain does not panic, and we never
+    /// silently downgrade the transport), but its connect kind is
+    /// `TlsFailClosed` so every connection attempt refuses rather than
+    /// falling back to default native+webpki anchors.
+    #[cfg(feature = "native-tls-rustls")]
+    #[tokio::test]
+    async fn tls_pool_fails_closed_when_configured_trust_unresolved() {
+        let pool = build_pool(
+            vec!["127.0.0.1:9440".to_string()],
+            ConnectKindConfig::Tls {
+                server_name: "example.invalid".to_string(),
+            },
+            HandshakeConfig::default(),
+            PoolConfig::default(),
+            TcpTls::ConfiguredButFailed,
+        )
+        .expect("configured-but-failed trust still BUILDS a (fail-closed) pool");
+        // Connecting must refuse -- fail closed, no default-trust fallback.
+        let err = match pool.get().await {
+            Ok(_) => panic!("a fail-closed TLS pool must refuse to connect"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refusing to connect with default trust"),
+            "expected fail-closed connect error, got: {msg}"
+        );
     }
 }

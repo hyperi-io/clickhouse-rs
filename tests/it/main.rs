@@ -298,7 +298,11 @@ mod tcp_handshake_live;
 mod tcp_insert_live;
 #[cfg(feature = "tcp")]
 mod tcp_query_live;
+#[cfg(all(feature = "tcp", feature = "native-tls-rustls"))]
+mod tcp_tls_live;
 mod time;
+#[cfg(all(feature = "tcp", feature = "native-tls-rustls"))]
+mod tls_live;
 mod user_agent;
 mod uuid;
 mod variant;

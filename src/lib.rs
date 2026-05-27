@@ -357,6 +357,41 @@ impl Client {
         client
     }
 
+    /// Construct a `Client` whose transport is TLS over TCP against
+    /// ClickHouse's native binary protocol (port 9440 by default).
+    ///
+    /// `addr` is the same `host:port` string accepted by
+    /// [`Self::tcp`]. `server_name` is the SNI sent in the rustls
+    /// ClientHello and the name the server certificate is validated
+    /// against; this is intentionally independent of `addr` so a
+    /// caller can connect to an IP literal while still presenting a
+    /// hostname-based SNI (e.g. service-mesh setups).
+    ///
+    /// Trust anchors default to OS native roots plus the compiled webpki
+    /// bundle. For a private/internal CA, add it with
+    /// [`Self::try_with_tls_root_ca`] (and
+    /// [`Self::try_with_tls_intermediate_certs`]), or supply a full
+    /// config via [`Self::with_tls_config`]; the same trust applies to
+    /// the HTTP transport.
+    ///
+    /// Available only when both the `tcp` and `native-tls-rustls`
+    /// features are enabled.
+    ///
+    /// See [`Self::tcp`] for the constructor-time `with_tcp_pool_*`
+    /// rebuild caveat -- it applies identically here.
+    #[cfg(all(feature = "tcp", feature = "native-tls-rustls"))]
+    pub fn tcp_tls(addr: impl Into<String>, server_name: impl Into<String>) -> Self {
+        let addr_str = addr.into();
+        let sni = server_name.into();
+        let mut client = Self::default();
+        client.tcp_config.endpoints = vec![addr_str];
+        client.tcp_config.kind = tcp::pool::ConnectKindConfig::Tls { server_name: sni };
+        client.tcp_pool = Some(Arc::new(client.build_tcp_pool().expect(
+            "tcp: failed to build pool (this is a bug -- runtime is always set)",
+        )));
+        client
+    }
+
     /// Max simultaneous TCP connections. Default 8 (matches the HTTP
     /// pool default).
     ///
@@ -453,22 +488,22 @@ impl Client {
     }
 
     /// Set the full list of candidate TCP server endpoints, replacing
-    /// whatever [`Self::tcp`] seeded. The pool's connection manager
-    /// round-robins across them and fails over to the next on a
-    /// refused/unresolvable endpoint within a single connect pass --
-    /// giving multi-host + connect-failover. All endpoints share the
-    /// one handshake config (`with_user` / `with_password` /
-    /// `with_database`), so they must be interchangeable replicas of
-    /// the same logical server.
+    /// whatever [`Self::tcp`] / [`Self::tcp_tls`] seeded. The pool's
+    /// connection manager round-robins across them and fails over to
+    /// the next on a refused/unresolvable endpoint within a single
+    /// connect pass -- giving multi-host + connect-failover. All
+    /// endpoints share the one handshake config (`with_user` /
+    /// `with_password` / `with_database`) and TLS selection, so they
+    /// must be interchangeable replicas of the same logical server.
     ///
     /// Rebuilds the pool, so the same **constructor-time-only**
     /// discipline as [`Self::with_tcp_pool_size`] applies: call before
     /// issuing any query.
     ///
     /// # Panics
-    /// Panics if the client was not constructed via [`Self::tcp`], or
-    /// if `addrs` yields no endpoints (the pool manager's round-robin
-    /// requires a non-empty list).
+    /// Panics if the client was not constructed via [`Self::tcp`] /
+    /// [`Self::tcp_tls`], or if `addrs` yields no endpoints (the pool
+    /// manager's round-robin requires a non-empty list).
     #[cfg(feature = "tcp")]
     pub fn with_tcp_addrs(
         mut self,
@@ -502,7 +537,8 @@ impl Client {
     /// extra backed-off acquire passes on top.
     ///
     /// # Panics
-    /// Panics if the client was not constructed via [`Self::tcp`].
+    /// Panics if the client was not constructed via [`Self::tcp`] /
+    /// [`Self::tcp_tls`].
     #[cfg(feature = "tcp")]
     pub fn with_tcp_retry(mut self, retry: impl Into<Option<RetryPolicy>>) -> Self {
         assert!(
@@ -594,9 +630,31 @@ impl Client {
         // picked up on reconnect.
         tcp::pool::build_pool(
             self.tcp_config.endpoints.clone(),
+            self.tcp_config.kind.clone(),
             handshake,
             self.tcp_config.pool,
+            // Thread the TLS intent so the pool's TLS arm can fail closed.
+            // - no trust configured -> default native+webpki anchors;
+            // - configured + resolved -> use that config;
+            // - configured + unresolved -> refuse to build (never fall
+            //   back to broad default trust).
+            #[cfg(feature = "native-tls-rustls")]
+            self.tcp_tls_intent(),
         )
+    }
+
+    /// Compute the build-time TLS intent for the TCP pool from the
+    /// Client's trust state. Mirrors the HTTP fail-closed logic in
+    /// [`Self::rebuild_http_for_tls`]: a trust that was configured
+    /// (`tls_source` is Some) but failed to resolve (`tls_resolved` is
+    /// None) must NOT fall back to default trust.
+    #[cfg(all(feature = "tcp", feature = "native-tls-rustls"))]
+    fn tcp_tls_intent(&self) -> tcp::pool::TcpTls {
+        match (&self.tls_source, &self.tls_resolved) {
+            (None, _) => tcp::pool::TcpTls::NotConfigured,
+            (Some(_), Some(cfg)) => tcp::pool::TcpTls::Resolved(cfg.clone()),
+            (Some(_), None) => tcp::pool::TcpTls::ConfiguredButFailed,
+        }
     }
 
     /// Idle-connection timeout for the default HTTP client's pool.
@@ -898,6 +956,7 @@ impl Client {
         self.tls_source = Some(tls::TlsConfigSource::Explicit(arc.clone()));
         self.tls_resolved = Some(arc);
         self.rebuild_http_for_tls();
+        self.rebuild_tcp_pool_for_tls();
         self
     }
 
@@ -996,6 +1055,7 @@ impl Client {
         self.tls_resolved = tls::build_client_config(&src).ok();
         self.tls_source = Some(src);
         self.rebuild_http_for_tls();
+        self.rebuild_tcp_pool_for_tls();
     }
 
     /// Fallible mutation (reads CA files). Surfaces resolve errors.
@@ -1012,6 +1072,7 @@ impl Client {
         self.tls_resolved = Some(cfg);
         self.tls_source = Some(src);
         self.rebuild_http_for_tls();
+        self.rebuild_tcp_pool_for_tls();
         Ok(())
     }
 
@@ -1042,6 +1103,36 @@ impl Client {
         )
     ))]
     fn rebuild_http_for_tls(&mut self) {}
+
+    /// Rebuild the TCP pool so a TLS-trust change takes effect on an
+    /// already-constructed TCP-transport client (the pool bakes the
+    /// resolved config in at build time, so a later `with_tls_*` needs a
+    /// rebuild). No-op for HTTP clients (no pool to rebuild). Same
+    /// constructor-time-only discipline as the `with_tcp_pool_*`
+    /// builders: a rebuild after the first acquire strands in-flight
+    /// connections until they drain.
+    #[cfg(all(
+        feature = "tcp",
+        feature = "native-tls-rustls"
+    ))]
+    fn rebuild_tcp_pool_for_tls(&mut self) {
+        if self.tcp_pool.is_some() {
+            self.tcp_pool = Some(Arc::new(self.build_tcp_pool().expect(
+                "tcp: failed to rebuild pool after a TLS-trust change",
+            )));
+        }
+    }
+
+    /// No-op when the TCP transport is not compiled in.
+    #[cfg(all(
+        not(all(feature = "tcp", feature = "native-tls-rustls")),
+        any(
+            feature = "rustls-tls-aws-lc",
+            feature = "rustls-tls-ring",
+            feature = "native-tls-rustls"
+        )
+    ))]
+    fn rebuild_tcp_pool_for_tls(&mut self) {}
 
     /// Used to specify settings that will be passed to all queries.
     ///
