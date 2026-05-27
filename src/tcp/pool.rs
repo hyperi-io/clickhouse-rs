@@ -57,6 +57,7 @@ use crate::error::{Error, Result};
 use crate::tcp::connect::{self, ConnectKind};
 use crate::tcp::connection_actor::{ActorConfig, ConnectionActor, ConnectionHandle};
 use crate::tcp::handshake::HandshakeConfig;
+use crate::tcp::retry::RetryPolicy;
 
 /// Default maximum number of pooled TCP connections per pool.
 ///
@@ -268,6 +269,37 @@ impl Default for PoolConfig {
             read_timeout: None,
         }
     }
+}
+
+/// Aggregated TCP-client knobs the `Client` builder threads through
+/// to [`build_pool`]. Held inside `Client` so `with_tcp_pool_*` /
+/// `with_tcp_addrs` builders can rebuild the pool with new dials;
+/// matches the HTTP `pool_config` shape on the same struct.
+///
+/// Endpoints are stored as the original strings the caller supplied
+/// (e.g. `["127.0.0.1:9000"]`) so we can re-resolve at rebuild time
+/// rather than caching a `SocketAddr` that may have gone stale.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TcpClientConfig {
+    /// Candidate server addresses as the caller supplied them.
+    /// Resolved at pool-build time, not at `Client::tcp` time, so a
+    /// hostname that gains new A records after construction picks them
+    /// up on rebuild. `Client::tcp` sets a single-element list;
+    /// `with_tcp_addrs` replaces it with the full list. A
+    /// default-constructed config (HTTP clients) leaves it empty; the
+    /// TCP pool is only built once a constructor has populated it.
+    pub endpoints: Vec<String>,
+    /// Handshake parameters (database, credentials, quota_key).
+    pub handshake: HandshakeConfig,
+    /// Pool dials.
+    pub pool: PoolConfig,
+    /// Bounded-backoff retry policy for idempotent operations
+    /// (SELECT, opt-in `ExecuteQuery`, Ping). `None` (default) means
+    /// no extra passes -- endpoint failover still happens inside
+    /// `create`. Consulted at dispatch time by
+    /// [`crate::tcp::client_ext`], so changing it does NOT require a
+    /// pool rebuild.
+    pub retry: Option<RetryPolicy>,
 }
 
 /// Build a TCP connection pool over the supplied endpoint list,

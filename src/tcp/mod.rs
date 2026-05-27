@@ -34,6 +34,7 @@
 // from the lint.
 #![allow(dead_code)]
 
+pub(crate) mod client_ext;
 pub(crate) mod client_info;
 pub mod connect;
 pub mod connection_actor;
@@ -42,6 +43,7 @@ pub mod handshake;
 pub(crate) mod pool;
 pub(crate) mod protocol;
 pub(crate) mod reader;
+pub(crate) mod retry;
 pub(crate) mod transport;
 pub(crate) mod writer;
 
@@ -51,4 +53,5 @@ pub(crate) mod writer;
 // `MaybeTlsStream` as the opaque connected-stream return type.
 pub use self::handshake::HandshakeConfig;
 pub use self::protocol::ServerHello;
+pub use self::retry::RetryPolicy;
 pub use self::transport::MaybeTlsStream;

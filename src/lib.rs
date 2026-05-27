@@ -49,7 +49,7 @@ pub mod native;
 #[cfg(feature = "tcp")]
 pub mod tcp;
 #[cfg(feature = "tcp")]
-pub use tcp::HandshakeConfig;
+pub use tcp::{HandshakeConfig, RetryPolicy};
 mod cursors;
 mod headers;
 mod http_client;
@@ -135,6 +135,29 @@ pub struct Client {
         feature = "native-tls-rustls"
     ))]
     tls_resolved: Option<std::sync::Arc<rustls::ClientConfig>>,
+
+    /// Optional TCP transport overlay. When `Some`, [`Client::query`]
+    /// (via [`crate::query::Query::execute`]) and
+    /// [`Client::insert_native`] dispatch over the TCP transport
+    /// instead of HTTP. The HTTP path is untouched by this field --
+    /// existing callers that never call [`Client::tcp`] see no
+    /// behaviour change.
+    ///
+    /// Held by `Arc` so cloning the `Client` is cheap and so the
+    /// background TCP connection-actor stays alive as long as any
+    /// `Client` clone references the pool.
+    ///
+    /// Constructor-time dials ([`Client::with_tcp_pool_size`] etc.)
+    /// rebuild the pool with the new config; calls after the first
+    /// acquire panic, matching the HTTP `with_pool_*` pattern.
+    #[cfg(feature = "tcp")]
+    tcp_pool: Option<Arc<tcp::pool::NativePool>>,
+
+    /// TCP pool address + handshake config + dial knobs. Stored so
+    /// `with_tcp_pool_*` builders can rebuild the pool. Only consulted
+    /// when `tcp_pool` is `Some`.
+    #[cfg(feature = "tcp")]
+    tcp_config: tcp::pool::TcpClientConfig,
 
     #[cfg(feature = "test-util")]
     mocked: bool,
@@ -281,9 +304,299 @@ impl Client {
                 feature = "native-tls-rustls"
             ))]
             tls_resolved: None,
+            #[cfg(feature = "tcp")]
+            tcp_pool: None,
+            #[cfg(feature = "tcp")]
+            tcp_config: tcp::pool::TcpClientConfig::default(),
             #[cfg(feature = "test-util")]
             mocked: false,
         }
+    }
+
+    /// Construct a `Client` whose transport is the ClickHouse TCP
+    /// native protocol on port 9000 (default). `addr` is a `host:port`
+    /// string; it is resolved (via tokio's async resolver) when a
+    /// connection is first opened, not at this constructor, so an
+    /// unresolvable host surfaces as a query-time error rather than a
+    /// panic here.
+    ///
+    /// The returned `Client` carries a default-config TCP pool
+    /// (8 connections, 30s acquire timeout, 10s create timeout,
+    /// matching the HTTP defaults). Tune via
+    /// [`Self::with_tcp_pool_size`] and friends BEFORE the first
+    /// query -- they rebuild the pool, so any in-flight connections
+    /// from the prior pool are stranded until they drain.
+    ///
+    /// Credentials default to `(database="default", user="default",
+    /// password="")`. Override via [`Self::with_user`],
+    /// [`Self::with_password`], [`Self::with_database`]; the values
+    /// are read at handshake time, not at this constructor.
+    ///
+    /// The HTTP path is untouched -- the `Client` still holds a
+    /// default HTTP client for any code path that bypasses the TCP
+    /// overlay. Most users of `Client::tcp` will not exercise that
+    /// path, but it ensures `Client::default()` invariants still
+    /// hold (no panic on `with_url`, `set_setting`, etc.).
+    #[cfg(feature = "tcp")]
+    pub fn tcp(addr: impl Into<String>) -> Self {
+        let addr_str = addr.into();
+        let mut client = Self::default();
+        // Single-endpoint list; `with_tcp_addrs` replaces it with the
+        // full set for multi-host. The non-empty invariant the pool
+        // manager relies on holds because we always seed exactly one.
+        client.tcp_config.endpoints = vec![addr_str];
+        // Build the pool eagerly. Address resolution is deferred to the
+        // first connection (`Manager::create`), so a bad host does NOT
+        // fail here -- it surfaces as a pool-acquire error on first
+        // use. `expect` is sound because the only `build_pool` failure
+        // is a missing tokio runtime, which our config rules out
+        // (`Runtime::Tokio1` is always set).
+        client.tcp_pool = Some(Arc::new(client.build_tcp_pool().expect(
+            "tcp: pool build failed despite Runtime::Tokio1 being set (unreachable)",
+        )));
+        client
+    }
+
+    /// Max simultaneous TCP connections. Default 8 (matches the HTTP
+    /// pool default).
+    ///
+    /// **Constructor-time only.** Rebuilds the pool. Calls after the
+    /// first query strand any in-flight connections from the prior
+    /// pool until they drain through their own actor task. Repeated
+    /// mid-flight calls compound this. Match the HTTP
+    /// `with_pool_*` discipline: set before issuing any query.
+    ///
+    /// # Panics
+    /// Panics if the client was not constructed via [`Self::tcp`].
+    #[cfg(feature = "tcp")]
+    pub fn with_tcp_pool_size(mut self, n: usize) -> Self {
+        assert!(
+            self.tcp_pool.is_some(),
+            "with_tcp_pool_size requires a TCP-transport Client (constructed via Client::tcp)"
+        );
+        self.tcp_config.pool.max_size = n;
+        self.tcp_pool = Some(Arc::new(self.build_tcp_pool().expect(
+            "tcp: failed to rebuild pool with new max_size",
+        )));
+        self
+    }
+
+    /// Upper bound on how long a caller waits for a free pool slot.
+    /// `None` waits indefinitely. Default: 30s.
+    ///
+    /// **Constructor-time only.** See [`Self::with_tcp_pool_size`]
+    /// for the rebuild caveat.
+    ///
+    /// # Panics
+    /// Panics if the client was not constructed via [`Self::tcp`].
+    #[cfg(feature = "tcp")]
+    pub fn with_tcp_pool_acquire_timeout(mut self, d: Option<Duration>) -> Self {
+        assert!(
+            self.tcp_pool.is_some(),
+            "with_tcp_pool_acquire_timeout requires a TCP-transport Client"
+        );
+        self.tcp_config.pool.acquire_timeout = d;
+        self.tcp_pool = Some(Arc::new(self.build_tcp_pool().expect(
+            "tcp: failed to rebuild pool with new acquire_timeout",
+        )));
+        self
+    }
+
+    /// Upper bound on connect + handshake when the pool opens a new
+    /// connection. `None` waits indefinitely. Default: 10s.
+    ///
+    /// **Constructor-time only.** See [`Self::with_tcp_pool_size`]
+    /// for the rebuild caveat.
+    ///
+    /// # Panics
+    /// Panics if the client was not constructed via [`Self::tcp`].
+    #[cfg(feature = "tcp")]
+    pub fn with_tcp_pool_create_timeout(mut self, d: Option<Duration>) -> Self {
+        assert!(
+            self.tcp_pool.is_some(),
+            "with_tcp_pool_create_timeout requires a TCP-transport Client"
+        );
+        self.tcp_config.pool.create_timeout = d;
+        self.tcp_pool = Some(Arc::new(self.build_tcp_pool().expect(
+            "tcp: failed to rebuild pool with new create_timeout",
+        )));
+        self
+    }
+
+    /// Per-packet idle read timeout for TCP queries, streams, and the
+    /// INSERT handshake. When `Some(d)`, a read that goes `d` without
+    /// receiving ANY packet poisons the connection (the pool drops it)
+    /// and surfaces a retriable [`error::Error::TimedOut`]. The timer
+    /// resets on every packet, so it bounds the gap BETWEEN packets, not
+    /// total query time -- a long streaming SELECT that keeps delivering
+    /// blocks never trips it. `None` (default) leaves reads bounded only
+    /// by caller-side cancellation (dropping the cursor / future), which
+    /// is the pre-dial behaviour.
+    ///
+    /// **Constructor-time only.** See [`Self::with_tcp_pool_size`]
+    /// for the rebuild caveat.
+    ///
+    /// # Panics
+    /// Panics if the client was not constructed via [`Self::tcp`].
+    #[cfg(feature = "tcp")]
+    pub fn with_tcp_read_timeout(mut self, d: Option<Duration>) -> Self {
+        assert!(
+            self.tcp_pool.is_some(),
+            "with_tcp_read_timeout requires a TCP-transport Client"
+        );
+        self.tcp_config.pool.read_timeout = d;
+        self.tcp_pool = Some(Arc::new(
+            self.build_tcp_pool()
+                .expect("tcp: failed to rebuild pool with new read_timeout"),
+        ));
+        self
+    }
+
+    /// Set the full list of candidate TCP server endpoints, replacing
+    /// whatever [`Self::tcp`] seeded. The pool's connection manager
+    /// round-robins across them and fails over to the next on a
+    /// refused/unresolvable endpoint within a single connect pass --
+    /// giving multi-host + connect-failover. All endpoints share the
+    /// one handshake config (`with_user` / `with_password` /
+    /// `with_database`), so they must be interchangeable replicas of
+    /// the same logical server.
+    ///
+    /// Rebuilds the pool, so the same **constructor-time-only**
+    /// discipline as [`Self::with_tcp_pool_size`] applies: call before
+    /// issuing any query.
+    ///
+    /// # Panics
+    /// Panics if the client was not constructed via [`Self::tcp`], or
+    /// if `addrs` yields no endpoints (the pool manager's round-robin
+    /// requires a non-empty list).
+    #[cfg(feature = "tcp")]
+    pub fn with_tcp_addrs(
+        mut self,
+        addrs: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        assert!(
+            self.tcp_pool.is_some(),
+            "with_tcp_addrs requires a TCP-transport Client (constructed via Client::tcp)"
+        );
+        let endpoints: Vec<String> = addrs.into_iter().map(Into::into).collect();
+        assert!(
+            !endpoints.is_empty(),
+            "with_tcp_addrs requires at least one endpoint"
+        );
+        self.tcp_config.endpoints = endpoints;
+        self.tcp_pool = Some(Arc::new(self.build_tcp_pool().expect(
+            "tcp: failed to rebuild pool with new endpoints",
+        )));
+        self
+    }
+
+    /// Set the bounded-backoff [`RetryPolicy`] for idempotent TCP
+    /// operations (streaming SELECT, opt-in `ExecuteQuery` via
+    /// [`Query::idempotent`][crate::query::Query::idempotent], and
+    /// [`Self::ping`]). `None` clears it.
+    ///
+    /// Unlike the pool dials, this does NOT rebuild the pool -- the
+    /// policy is consulted at dispatch time, not baked into the pool.
+    /// Endpoint failover (across the [`Self::with_tcp_addrs`] list) is
+    /// always on regardless of this setting; the policy only adds the
+    /// extra backed-off acquire passes on top.
+    ///
+    /// # Panics
+    /// Panics if the client was not constructed via [`Self::tcp`].
+    #[cfg(feature = "tcp")]
+    pub fn with_tcp_retry(mut self, retry: impl Into<Option<RetryPolicy>>) -> Self {
+        assert!(
+            self.tcp_pool.is_some(),
+            "with_tcp_retry requires a TCP-transport Client (constructed via Client::tcp)"
+        );
+        self.tcp_config.retry = retry.into();
+        self
+    }
+
+    /// Read-side accessor for `Query::execute` / `insert_native` so
+    /// they can detect the TCP-transport variant. Returns `None` for
+    /// HTTP clients.
+    #[cfg(feature = "tcp")]
+    pub(crate) fn tcp_pool(&self) -> Option<&Arc<tcp::pool::NativePool>> {
+        self.tcp_pool.as_ref()
+    }
+
+    /// TCP-transport INSERT-session settings: database, plain
+    /// settings, and roles. Mirrors [`Query::tcp_settings`] so
+    /// `Client::with_roles(...)` reaches the INSERT path too;
+    /// omits HTTP-only knobs (compress / decompress /
+    /// enable_http_compression / default_format).
+    #[cfg(feature = "tcp")]
+    pub(crate) fn tcp_insert_settings(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(db) = &self.database {
+            out.push((settings::DATABASE.to_string(), db.clone()));
+        }
+        for (k, v) in &self.settings {
+            out.push((k.clone(), v.clone()));
+        }
+        for role in &self.roles {
+            out.push((settings::ROLE.to_string(), role.clone()));
+        }
+        out
+    }
+
+    /// Read-side accessor for the configured TCP retry policy so
+    /// `Query::execute` / `fetch_native_blocks` can thread it into the
+    /// dispatch helpers. `None` when no policy is set (the default).
+    #[cfg(feature = "tcp")]
+    pub(crate) fn tcp_retry(&self) -> Option<RetryPolicy> {
+        self.tcp_config.retry
+    }
+
+    /// Build or rebuild the TCP pool from `tcp_config`. Pulls the
+    /// authentication fields off the `Client` so handshake-time
+    /// credentials track `with_user` / `with_password` /
+    /// `with_database` / `with_access_token`.
+    #[cfg(feature = "tcp")]
+    fn build_tcp_pool(&self) -> Result<tcp::pool::NativePool> {
+        let mut handshake = self.tcp_config.handshake.clone();
+        // Layer Client-level credentials on top of the handshake
+        // defaults: with_database / with_user / with_password set on
+        // the Client take precedence over the HandshakeConfig
+        // defaults baked into tcp_config.
+        if let Some(db) = &self.database {
+            handshake.database = db.clone();
+        }
+        match &self.authentication {
+            Authentication::Credentials { user, password } => {
+                if let Some(u) = user {
+                    handshake.user = u.clone();
+                }
+                if let Some(p) = password {
+                    handshake.password = p.clone();
+                }
+            }
+            Authentication::Jwt { .. } => {
+                // TCP transport has no JWT auth path today. The
+                // access_token is ignored and the handshake uses the
+                // HandshakeConfig user/password defaults; warn so the
+                // mismatch is observable (the rustdoc on
+                // `with_access_token` documents this). A subsequent
+                // handshake against a server that requires JWT will
+                // then fail with an auth error.
+                tracing::warn!(
+                    target: "clickhouse::tcp",
+                    "Client::with_access_token has no effect on the TCP transport; \
+                     handshake will use user/password from the HandshakeConfig"
+                );
+            }
+        }
+        // Address resolution is deferred to each connection's
+        // `Manager::create` (async resolver), not done here -- so an
+        // unresolvable host surfaces as a pool-acquire error at first
+        // use rather than a panic at construction, and DNS changes are
+        // picked up on reconnect.
+        tcp::pool::build_pool(
+            self.tcp_config.endpoints.clone(),
+            handshake,
+            self.tcp_config.pool,
+        )
     }
 
     /// Idle-connection timeout for the default HTTP client's pool.
@@ -406,6 +719,16 @@ impl Client {
         // Assume our cached metadata is invalid.
         self.insert_metadata_cache = Default::default();
 
+        // The TCP pool bakes the database into the connection handshake
+        // at build time. If a pool was already built (TCP-transport
+        // Client), rebuild it so the new database reaches the wire.
+        #[cfg(feature = "tcp")]
+        if self.tcp_pool.is_some() {
+            self.tcp_pool = Some(std::sync::Arc::new(self.build_tcp_pool().expect(
+                "tcp: failed to rebuild pool after credential/database change",
+            )));
+        }
+
         self
     }
 
@@ -431,6 +754,14 @@ impl Client {
                 };
             }
         }
+        // TCP creds are baked into the handshake at pool-build time;
+        // rebuild an already-built pool so the new user reaches the wire.
+        #[cfg(feature = "tcp")]
+        if self.tcp_pool.is_some() {
+            self.tcp_pool = Some(std::sync::Arc::new(self.build_tcp_pool().expect(
+                "tcp: failed to rebuild pool after credential/database change",
+            )));
+        }
         self
     }
 
@@ -455,6 +786,14 @@ impl Client {
                     password: Some(password.into()),
                 };
             }
+        }
+        // TCP creds are baked into the handshake at pool-build time;
+        // rebuild an already-built pool so the new password reaches the wire.
+        #[cfg(feature = "tcp")]
+        if self.tcp_pool.is_some() {
+            self.tcp_pool = Some(std::sync::Arc::new(self.build_tcp_pool().expect(
+                "tcp: failed to rebuild pool after credential/database change",
+            )));
         }
         self
     }
@@ -499,6 +838,12 @@ impl Client {
     /// JWT token authentication is supported in ClickHouse Cloud only.
     /// Should not be called after [`Client::with_user`] or
     /// [`Client::with_password`].
+    ///
+    /// Applies to the HTTP transport only. The TCP transport
+    /// ([`Client::tcp`]) has no JWT auth path; a JWT set on a
+    /// TCP-transport client is ignored (with a `tracing::warn!`) and
+    /// the handshake falls back to user/password. Use
+    /// [`Client::with_user`] / [`Client::with_password`] for TCP.
     ///
     /// # Panics
     /// If called after [`Client::with_user`] or [`Client::with_password`].
@@ -892,9 +1237,60 @@ impl Client {
         sql::escape::identifier(table, &mut escaped_table_name)
             .map_err(|e| Error::Other(format!("error escaping table name: {e:?}").into()))?;
 
+        // TCP path skips `DESCRIBE TABLE` entirely -- the server
+        // echoes the column schema in the response to BeginInsert,
+        // so we let the transport tell us the columns rather than
+        // run a second round-trip. The HTTP path keeps the existing
+        // `DESCRIBE TABLE` (cached) since `InsertFormatted` needs
+        // the SQL with explicit column list at request-build time.
+        #[cfg(feature = "tcp")]
+        if self.tcp_pool().is_some() {
+            return insert_native::InsertNative::<T>::new_tcp_with_server_schema(
+                self,
+                &escaped_table_name,
+            )
+            .await;
+        }
+
         let metadata = self.get_insert_metadata(&escaped_table_name).await?;
         let row = metadata.to_row::<T>()?;
         insert_native::InsertNative::new(self, &escaped_table_name, row)
+    }
+
+    /// Open a `Format::Native` INSERT against `table` using a caller-supplied
+    /// runtime column list. Dispatches by transport: TCP if this `Client`
+    /// has a pool (`Client::tcp` / `with_tcp_addrs`); HTTP otherwise.
+    ///
+    /// Use when columns are supplied at runtime (e.g. from
+    /// `system.columns`) rather than derived from `T`. `T` still drives
+    /// RowBinary encoding via [`RowWrite`][crate::RowWrite] but is not
+    /// validated against `columns`.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if `columns` is empty, if `table` cannot be SQL-escaped, or
+    /// if transport-specific setup fails.
+    pub async fn insert_native_with_columns<T: Row>(
+        &self,
+        table: &str,
+        columns: &[(String, String)],
+    ) -> Result<insert_native::InsertNative<T>> {
+        // Router-level guard: HTTP fallback on Phase-3 chain currently
+        // depends on a pinned pre-fix `with_columns` whose own guard
+        // lives on a separate Phase-2 PR lineage. Reject empty columns
+        // here so both transports surface the same contract regardless
+        // of which Phase-2 PR lands first.
+        if columns.is_empty() {
+            return Err(Error::Other(
+                "Client::insert_native_with_columns: columns is empty; INSERT needs at least one column"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "tcp")]
+        if self.tcp_pool().is_some() {
+            return insert_native::InsertNative::<T>::with_columns_tcp(self, table, columns).await;
+        }
+        insert_native::InsertNative::<T>::with_columns(self, table, columns)
     }
 
     /// Start an `INSERT` statement sending pre-formatted data.
@@ -1066,7 +1462,11 @@ impl Client {
     /// through that path -- `SELECT 1` exercises the full query
     /// pipeline.
     pub async fn ping(&self) -> Result<()> {
-        self.query("SELECT 1").execute().await
+        // `SELECT 1` is trivially idempotent, so mark it as such: on the
+        // TCP transport this opts the health check into bounded-backoff
+        // retry of a transient connect/issue blip (no-op on HTTP and
+        // when no retry policy is configured).
+        self.query("SELECT 1").idempotent().execute().await
     }
 
 

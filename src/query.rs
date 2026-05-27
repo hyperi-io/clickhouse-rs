@@ -24,6 +24,12 @@ use crate::settings;
 pub struct Query {
     client: Client,
     sql: SqlBuilder,
+    /// Caller assertion that this statement is safe to replay. Only
+    /// consulted on the TCP transport's `execute()` path, where it
+    /// gates opt-in auto-retry of `ExecuteQuery`. Default `false` --
+    /// `execute()` is never auto-retried unless the caller opts in.
+    /// See [`Query::idempotent`].
+    idempotent: bool,
 }
 
 impl Query {
@@ -31,7 +37,30 @@ impl Query {
         Self {
             client: client.clone(),
             sql: SqlBuilder::new(template),
+            idempotent: false,
         }
+    }
+
+    /// Assert that this query is safe to replay, enabling opt-in
+    /// bounded-backoff auto-retry of a transient transport/connect
+    /// failure on the TCP transport's [`Self::execute`] path.
+    ///
+    /// `execute()` covers arbitrary statements -- some non-idempotent
+    /// (a plain `INSERT ... VALUES`, a mutation) -- so retry is NOT
+    /// automatic there: it activates only when the caller asserts the
+    /// statement can be safely re-issued (a `SELECT`, a `CREATE TABLE
+    /// IF NOT EXISTS`, an `INSERT` carrying an
+    /// `insert_deduplication_token`, etc.). The retry bounds come from
+    /// [`Client::with_tcp_retry`][crate::Client::with_tcp_retry]; with
+    /// no policy set this is a no-op beyond the always-on endpoint
+    /// failover.
+    ///
+    /// No effect on the HTTP transport or on streaming SELECTs via
+    /// `fetch_native_blocks` (those are inherently replay-safe and
+    /// retry independently of this flag).
+    pub fn idempotent(mut self) -> Self {
+        self.idempotent = true;
+        self
     }
 
     /// Display SQL query as string.
@@ -59,11 +88,45 @@ impl Query {
     }
 
     /// Executes the query.
+    ///
+    /// If the underlying [`Client`] was constructed via
+    /// [`Client::tcp`][crate::Client::tcp], the query is dispatched
+    /// over the TCP transport (acquires a pool connection, runs the
+    /// ExecuteQuery command, returns once the server emits
+    /// EndOfStream). Otherwise the HTTP transport path is used.
     pub async fn execute(self) -> Result<()> {
         // Enter the span for the `self.do_execute()` call
         let span = self.make_span(None);
 
         async {
+            #[cfg(feature = "tcp")]
+            if self.client.tcp_pool().is_some() {
+                // Snapshot the pieces the TCP path needs BEFORE
+                // consuming `self.sql` -- `SqlBuilder::finish` takes
+                // `self` by value, so we cannot call `tcp_settings`
+                // after it.
+                let pool = self.client.tcp_pool().cloned().unwrap();
+                let retry = self.client.tcp_retry();
+                let idempotent = self.idempotent;
+                let query_id = self
+                    .client
+                    .get_setting(settings::QUERY_ID)
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let tcp_settings = self.tcp_settings();
+                let sql = self.sql.finish()?;
+                return crate::tcp::client_ext::execute_query_via_pool(
+                    &pool,
+                    &query_id,
+                    &sql,
+                    &tcp_settings,
+                    retry,
+                    idempotent,
+                )
+                .await
+                .inspect_err(|e| e.record_in_current_span("error executing tcp query"));
+            }
+
             let mut response = self
                 .do_execute(None)
                 .inspect_err(|e| e.record_in_current_span("error executing query"))?;
@@ -75,6 +138,61 @@ impl Query {
         }
         .instrument(span)
         .await
+    }
+
+    /// Run a streaming SELECT over the TCP transport and return a
+    /// raw-block cursor.
+    ///
+    /// The cursor yields one
+    /// [`crate::native::decode::DecodedBlock`] per call until the
+    /// server emits `EndOfStream`. v1 only -- a per-row cursor that
+    /// bridges to the `Row` trait lands in a follow-up.
+    ///
+    /// # Errors
+    ///
+    /// `Err(Error::Custom)` if this `Client` was not constructed via
+    /// [`Client::tcp`][crate::Client::tcp]. The HTTP transport has no
+    /// equivalent "decoded blocks" surface today -- it returns row-
+    /// oriented `RowBinary` payloads; callers wanting whole-block
+    /// iteration over HTTP can use `fetch_bytes("Native")` and decode
+    /// themselves.
+    #[cfg(feature = "tcp")]
+    pub async fn fetch_native_blocks(self) -> Result<crate::tcp::cursor::TcpRawCursor> {
+        let Some(pool) = self.client.tcp_pool().cloned() else {
+            return Err(Error::Custom(
+                "fetch_native_blocks requires a TCP-transport Client (Client::tcp)".into(),
+            ));
+        };
+        let retry = self.client.tcp_retry();
+        let query_id = self
+            .client
+            .get_setting(settings::QUERY_ID)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let tcp_settings = self.tcp_settings();
+        let sql = self.sql.finish()?;
+        crate::tcp::client_ext::execute_stream_via_pool(&pool, &query_id, &sql, &tcp_settings, retry)
+            .await
+    }
+
+    /// Compose the `(name, value)` settings list to forward into a
+    /// TCP Query packet. Mirrors what `do_execute` puts on the HTTP
+    /// URL (database, plain settings, roles); omits the
+    /// HTTP-transport-only knobs (compress / decompress /
+    /// enable_http_compression / default_format).
+    #[cfg(feature = "tcp")]
+    pub(crate) fn tcp_settings(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(db) = &self.client.database {
+            out.push((settings::DATABASE.to_string(), db.clone()));
+        }
+        for (k, v) in &self.client.settings {
+            out.push((k.clone(), v.clone()));
+        }
+        for role in &self.client.roles {
+            out.push((settings::ROLE.to_string(), role.clone()));
+        }
+        out
     }
 
     /// Executes the query, returning a [`RowCursor`] to obtain results.

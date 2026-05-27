@@ -280,3 +280,19 @@ async fn end_finalises_request_with_format_native_url_param() {
     let body = recorder.body().await;
     assert!(!body.is_empty(), "request body should contain at least the block counts + headers");
 }
+
+#[tokio::test]
+async fn insert_native_with_columns_router_rejects_empty_columns() {
+    // Defense in depth: router rejects before transport dispatch so the
+    // HTTP-fallback path is safe even when the Phase-3 chain hasn't
+    // inherited the Phase-2 `with_columns` empty-list guard.
+    let client = Client::default();
+    let err = match client.insert_native_with_columns::<Tiny>("tiny", &[]).await {
+        Ok(_) => panic!("empty columns must reject before transport dispatch"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err}").contains("empty"),
+        "expected router-level rejection wording, got: {err}",
+    );
+}

@@ -263,6 +263,8 @@ mod https_errors;
 mod insert;
 mod insert_formatted;
 mod insert_native;
+#[cfg(feature = "tcp")]
+mod insert_native_tcp_live;
 #[cfg(feature = "inserter")]
 mod inserter;
 mod native_roundtrip_live;
@@ -288,6 +290,8 @@ mod row_serde_isolation_live;
 mod server_exception_live;
 mod table_engine;
 mod table_engine_live;
+#[cfg(feature = "tcp")]
+mod tcp_client_live;
 #[cfg(feature = "tcp")]
 mod tcp_handshake_live;
 #[cfg(feature = "tcp")]
