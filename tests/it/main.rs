@@ -288,6 +288,8 @@ mod row_serde_isolation_live;
 mod server_exception_live;
 mod table_engine;
 mod table_engine_live;
+#[cfg(feature = "tcp")]
+mod tcp_handshake_live;
 mod time;
 mod user_agent;
 mod uuid;

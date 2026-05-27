@@ -47,7 +47,9 @@ mod bytes_ext;
 mod compression;
 pub mod native;
 #[cfg(feature = "tcp")]
-pub(crate) mod tcp;
+pub mod tcp;
+#[cfg(feature = "tcp")]
+pub use tcp::HandshakeConfig;
 mod cursors;
 mod headers;
 mod http_client;

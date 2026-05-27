@@ -162,14 +162,16 @@ pub(crate) enum ChunkedProtocolMode {
 // Handshake + packet payload staging types
 // ---------------------------------------------------------------------------
 
-/// Server Hello payload parsed by the handshake reader.
+/// Server Hello payload parsed by the handshake reader. Returned to
+/// callers from [`crate::tcp::connect::open_handshaken`] so they can
+/// pin connection state to the negotiated revision.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ServerHello {
-    pub(crate) server_name: String,
-    pub(crate) version: (u64, u64, u64),
-    pub(crate) revision: u64,
-    pub(crate) timezone: Option<String>,
-    pub(crate) display_name: Option<String>,
+pub struct ServerHello {
+    pub server_name: String,
+    pub version: (u64, u64, u64),
+    pub revision: u64,
+    pub timezone: Option<String>,
+    pub display_name: Option<String>,
 }
 
 /// TCP-protocol staging type for a server exception. The wire format

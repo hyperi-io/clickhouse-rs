@@ -10,6 +10,10 @@
 //!   Exception, Progress, ProfileInfo, TableColumns, Pong, EndOfStream,
 //!   Log, ProfileEvents, TimezoneUpdate) over the
 //!   [`crate::native::io::ClickHouseRead`] trait.
+//! - [`connect`] -- `connect_plain` (TcpStream + TCP_NODELAY + keepalive)
+//!   and `open_handshaken` (connect + handshake) entry points.
+//! - [`handshake`] -- `HandshakeConfig` + `handshake()` orchestrator
+//!   driving send-Hello / recv-ServerHello / send-addendum.
 //!
 //! Wire-format primitives (varint, length-prefixed string, fixed-width
 //! LE) come from [`crate::native::io`]; this module does not duplicate
@@ -25,7 +29,17 @@
 #![allow(dead_code)]
 
 pub(crate) mod client_info;
+pub mod connect;
+pub mod handshake;
 pub(crate) mod protocol;
 pub(crate) mod reader;
 pub(crate) mod transport;
 pub(crate) mod writer;
+
+// Re-exports for the public TCP API: callers (and the `tests/it/`
+// integration suite) need `HandshakeConfig` to drive the handshake,
+// `ServerHello` to inspect what the server advertised, and
+// `MaybeTlsStream` as the opaque connected-stream return type.
+pub use self::handshake::HandshakeConfig;
+pub use self::protocol::ServerHello;
+pub use self::transport::MaybeTlsStream;
