@@ -25,6 +25,7 @@ pub mod batch_isolation;
 pub mod error;
 pub mod insert;
 pub mod insert_formatted;
+pub mod insert_native;
 #[cfg(feature = "inserter")]
 pub mod inserter;
 pub mod progress;
@@ -44,6 +45,7 @@ pub mod types;
 
 mod bytes_ext;
 mod compression;
+pub mod native;
 mod cursors;
 mod headers;
 mod http_client;
@@ -865,6 +867,32 @@ impl Client {
         inserter::Inserter::new(self, table)
     }
 
+    /// Start a new `INSERT` statement that will ship rows in the
+    /// ClickHouse `Native` (columnar) format over HTTP.
+    ///
+    /// Like [`Client::insert`], this resolves the column schema from
+    /// the server (one DESCRIBE TABLE per call, cached). The
+    /// returned [`InsertNative<T>`][insert_native::InsertNative]
+    /// chunks the input into Native blocks bounded by row count
+    /// (default 100k rows) and serialised byte size (default
+    /// 10 MiB); both ceilings can be overridden via
+    /// [`with_max_rows_per_block`][insert_native::InsertNative::with_max_rows_per_block]
+    /// and
+    /// [`with_max_bytes_per_block`][insert_native::InsertNative::with_max_bytes_per_block].
+    /// `end()` ships the trailing partial block.
+    pub async fn insert_native<T: Row>(
+        &self,
+        table: &str,
+    ) -> Result<insert_native::InsertNative<T>> {
+        let mut escaped_table_name = String::new();
+        sql::escape::identifier(table, &mut escaped_table_name)
+            .map_err(|e| Error::Other(format!("error escaping table name: {e:?}").into()))?;
+
+        let metadata = self.get_insert_metadata(&escaped_table_name).await?;
+        let row = metadata.to_row::<T>()?;
+        insert_native::InsertNative::new(self, &escaped_table_name, row)
+    }
+
     /// Start an `INSERT` statement sending pre-formatted data.
     ///
     /// `sql` should be an `INSERT INTO ... FORMAT <format name>` statement.
@@ -1240,6 +1268,10 @@ impl Client {
 mod formats {
     pub(crate) const ROW_BINARY: &str = "RowBinary";
     pub(crate) const ROW_BINARY_WITH_NAMES_AND_TYPES: &str = "RowBinaryWithNamesAndTypes";
+    /// ClickHouse Native columnar block format
+    /// (<https://clickhouse.com/docs/interfaces/formats#native>).
+    /// Used by [`insert::Insert::with_native_format`].
+    pub(crate) const NATIVE: &str = "Native";
 }
 
 mod settings {
